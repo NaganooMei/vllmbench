@@ -1,0 +1,12 @@
+{
+  "base_url": "http://localhost:18081",
+  "model": "/data/models/GLM-5.3-Flash-w8a8",
+  "served_model": "glm",
+  "dp": 2,
+  "routing": {"mode": "auto"},
+  "metrics": {"enabled": false},
+  "cases": [
+    {"input_len": 32768, "output_len": 512, "hit_rate": 0.9, "concurrency": 40, "num_requests": 40},
+    {"input_len": 131072, "output_len": 512, "hit_rate": 0.9, "concurrency": 10, "num_requests": 10}
+  ]
+}
