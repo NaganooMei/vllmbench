@@ -76,6 +76,8 @@ python bench.py cache bench.json --dp-rank 0
 
 添加 `--collect-metrics` 即可采集正式命中轮次。
 
+服务需要开放 `/metrics`，UCM 的分层统计和耗时分布需要服务端启用相应的 UCM metrics。客户端采集选项控制本轮快照与报表导出。
+
 ```bash
 python bench.py hbm bench.json --collect-metrics
 python bench.py cache bench.json --collect-metrics
