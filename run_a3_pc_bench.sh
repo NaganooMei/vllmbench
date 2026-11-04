@@ -57,6 +57,7 @@ BASE_SEED=${SEED:-2004}
 BLOCK_TOKENS=${BLOCK_TOKENS:-1}
 RESULT_DIR=${RESULT_DIR:-./a3_pc_results}
 DRY_RUN=${DRY_RUN:-0}
+BENCH_OPTIONS=()
 
 if [[ ! $BLOCK_TOKENS =~ ^[1-9][0-9]*$ ]]; then
     echo 'BLOCK_TOKENS must be a positive integer.' >&2
@@ -68,15 +69,22 @@ if ((BLOCK_TOKENS > 32768 * 9 / 10)); then
 fi
 
 if [[ $DRY_RUN != 1 ]]; then
-    # A ready check sends a real copy of the first measured prompt.
-    # Require the option that lets us disable it before sending any requests.
-    BENCH_HELP=$(vllm bench serve --help)
-    for option in --ready-check-timeout-sec --header --random-prefix-len; do
+    # Some versions show only argument groups with plain --help.
+    BENCH_HELP=$(vllm bench serve --help=all 2>&1) || BENCH_HELP=$(vllm bench serve --help)
+    for option in --header --random-prefix-len; do
         if [[ $BENCH_HELP != *"$option"* ]]; then
             echo "Installed vllm bench serve does not support $option." >&2
             exit 2
         fi
     done
+    if [[ $BENCH_HELP == *"--ready-check-timeout-sec"* ]]; then
+        BENCH_OPTIONS+=(--ready-check-timeout-sec 0)
+    else
+        echo 'This bench version may run an initial prompt probe and warm its cache before measurement.' >&2
+    fi
+    if [[ $BENCH_HELP == *"--num-warmups"* ]]; then
+        BENCH_OPTIONS+=(--num-warmups 0)
+    fi
     mkdir -p "$RESULT_DIR"
 fi
 RUN_ID=$(date +%Y%m%d_%H%M%S)_$$
@@ -100,8 +108,7 @@ run_bench() {
         --max-concurrency "$concurrency"
         --request-rate inf
         --ignore-eos
-        --num-warmups 0
-        --ready-check-timeout-sec 0
+        "${BENCH_OPTIONS[@]}"
         --save-result --save-detailed
         --result-dir "$RESULT_DIR"
         --result-filename "${result_name}.json"
