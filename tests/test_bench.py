@@ -462,7 +462,11 @@ class WorkflowTest(unittest.TestCase):
         )
         self.assertEqual(row["status"], "failed")
         self.assertTrue(row["validation_errors"])
-        self.assertFalse(list((self.root / "results").glob("*.lock")))
+        # The lock file persists; its OS lock must have been released on failure.
+        locks = list((self.root / "results").glob("*.lock"))
+        self.assertEqual(len(locks), 1)
+        with bench.experiment_lock(locks[0].parent, locks[0].stem.removeprefix(".")):
+            pass
 
     def test_zero_and_full_hit_rates_block_alignment_and_validation(self):
         self.config["block_tokens"] = 16
@@ -515,6 +519,51 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("endpoint unavailable", result["metrics_status"])
         self.assertTrue(Path(result["bench_result_path"]).exists())
+
+
+class ExperimentLockTest(unittest.TestCase):
+    def test_lock_excludes_overlap_and_can_be_reused_after_exit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with bench.experiment_lock(directory, "test"):
+                with self.assertRaisesRegex(RuntimeError, "already holds"):
+                    with bench.experiment_lock(directory, "test"):
+                        self.fail("overlapping experiment acquired lock")
+            self.assertTrue((directory / ".test.lock").exists())
+            with bench.experiment_lock(directory, "test"):
+                pass
+
+    def test_abrupt_process_exit_releases_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            script = (
+                "import os, sys, bench\n"
+                "from pathlib import Path\n"
+                "with bench.experiment_lock(Path(sys.argv[1]), 'test'):\n"
+                "    os._exit(0)\n"
+            )
+            subprocess.run(
+                [sys.executable, "-c", script, temporary], cwd=bench.ROOT, check=True
+            )
+            with bench.experiment_lock(Path(temporary), "test"):
+                pass
+
+    def test_legacy_stale_pid_is_recovered_but_live_pid_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            lock = directory / ".test.lock"
+            lock.write_text(str(os.getpid()))
+            with self.assertRaisesRegex(RuntimeError, "older experiment"):
+                with bench.experiment_lock(directory, "test"):
+                    self.fail("live legacy PID was ignored")
+            self.assertEqual(lock.read_text(), str(os.getpid()))
+            with mock.patch("bench.pid_is_running", return_value=False):
+                with bench.experiment_lock(directory, "test"):
+                    pass
+            self.assertEqual(json.loads(lock.read_text())["lock"], "os")
+
+    def test_pid_check_distinguishes_current_and_missing_process(self):
+        self.assertTrue(bench.pid_is_running(os.getpid()))
+        self.assertFalse(bench.pid_is_running(2**31 - 1))
 
 
 class MetricsTest(unittest.TestCase):

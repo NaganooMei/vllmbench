@@ -199,21 +199,89 @@ def fingerprint(config: dict) -> str:
     ).hexdigest()[:16]
 
 
+def pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return (
+                ctypes.get_last_error() != 87
+            )  # Invalid PID; other errors are ambiguous.
+        try:
+            exit_code = wintypes.DWORD()
+            return (
+                not kernel.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                or exit_code.value == 259
+            )
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 @contextmanager
 def experiment_lock(directory: Path, key: str):
     lock = directory / f".{key}.lock"
-    try:
-        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError as error:
-        raise RuntimeError(
-            f"An experiment already holds {lock}. Check its recorded PID before removing a stale lock."
-        ) from error
-    try:
-        with os.fdopen(descriptor, "w") as output:
-            output.write(str(os.getpid()))
-        yield
-    finally:
-        lock.unlink(missing_ok=True)
+    with lock.open("a+b") as output:
+        if os.name == "nt":
+            import msvcrt
+
+            output.seek(0, os.SEEK_END)
+            if not output.tell():
+                output.write(b"\0")
+                output.flush()
+            output.seek(0)
+            acquire = lambda: msvcrt.locking(output.fileno(), msvcrt.LK_NBLCK, 1)
+            release = lambda: msvcrt.locking(output.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            acquire = lambda: fcntl.flock(
+                output.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+            )
+            release = lambda: fcntl.flock(output.fileno(), fcntl.LOCK_UN)
+        try:
+            acquire()
+        except OSError as error:
+            raise RuntimeError(
+                f"An experiment already holds {lock}. Another benchmark is still running; "
+                "the OS releases this lock when that process exits. Do not delete an active lock file."
+            ) from error
+        try:
+            output.seek(0)
+            previous = output.read().strip()
+            # Older versions used a plain PID file without an OS lock.
+            if previous.isdigit() and pid_is_running(int(previous)):
+                raise RuntimeError(
+                    f"An older experiment may still hold {lock} (PID {int(previous)}). "
+                    "Check that process before removing a legacy lock."
+                )
+            output.seek(0)
+            output.truncate()
+            output.write(json.dumps({"pid": os.getpid(), "lock": "os"}).encode())
+            output.flush()
+            yield
+        finally:
+            output.seek(0)
+            release()
+        # Keep the inode: unlinking can let concurrent processes lock different files.
 
 
 def http_request(url: str, method: str = "GET", timeout: float = 10) -> bytes:
