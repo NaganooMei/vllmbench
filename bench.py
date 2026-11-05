@@ -538,8 +538,6 @@ class Experiment:
                 "seeded" if self.mode == "posix-seed" else "complete"
             )
             self.save()
-        if self.warmups and self.mode == "posix-run":
-            reset_prefix(self.config, self.args.dry_run)
 
     def measure_case(self, case: dict, directory: Path) -> None:
         routing = self.config["routing"]

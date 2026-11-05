@@ -266,11 +266,52 @@ def write_summary(directory: Path) -> list[dict]:
         writer.writerow(FIELDS)
         writer.writerows(rows)
     write_workbook(directory / "summary.xlsx", FIELDS, rows)
+    headers = (
+        "Mode",
+        "Case",
+        "Target hit",
+        "HBM hit",
+        "External hit",
+        "Host Ready",
+        "Posix bytes",
+        "TTFT ms",
+        "Status",
+        "Metrics",
+    )
+    table = []
     for result in results:
         ttft = result.get("ttft_mean_ms")
-        ttft_text = f"{ttft:.2f} ms" if ttft is not None else "n.a."
+        values = [
+            result.get(field)
+            for field in (
+                "target_hit_rate",
+                "hbm_hit_rate",
+                "external_hit_rate",
+                "host_ready_shard_fraction",
+            )
+        ]
+        rates = [f"{value:.1%}" if value is not None else "n/a" for value in values]
+        posix_bytes = result.get("posix_read_bytes")
+        table.append(
+            (
+                result["mode"],
+                result["case"],
+                *rates,
+                f"{posix_bytes:,.0f}" if posix_bytes is not None else "n/a",
+                f"{ttft:.2f}" if ttft is not None else "n/a",
+                result["status"],
+                result.get("metrics_status", "unavailable"),
+            )
+        )
+    widths = [
+        max([len(header), *[len(row[index]) for row in table]])
+        for index, header in enumerate(headers)
+    ]
+    for row in [headers, *table]:
+        print(" | ".join(value.ljust(width) for value, width in zip(row, widths)))
+    if any(result.get("metrics_status") == "disabled" for result in results):
         print(
-            f"{result['mode']:8} {result['case']:24} {result['status']:8} TTFT {ttft_text}"
+            "Actual hit rates are n/a when metrics collection is disabled. Add --collect-metrics to capture them."
         )
     print(
         f"Summary saved to {directory / 'summary.csv'} and {directory / 'summary.xlsx'}"

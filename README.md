@@ -8,6 +8,8 @@
 
 每轮自动生成随机 seed，每个 case 使用独立 seed。预埋和测量使用相同 seed 和请求数，随机长度波动固定为 0。可在配置中设置整数 `seed` 复现指定实验，默认采用随机生成。
 
+UCM 预埋直接把 `--random-input-len` 设为目标命中长度，正式测量设为完整输入长度，两阶段均使用 `--dataset-name random --random-prefix-len 0`。例如 32K、90% 的预埋长度是 29491，正式长度是 32768。
+
 可选配置字段如下。
 
 ```json
@@ -88,7 +90,7 @@ Cache 和 Posix 命中测试在全部正式 case 之前增加独立的加载预�
 }
 ```
 
-Cache 模式先预埋预热前缀、reset HBM，再向每个 DP 发送预热加载请求。Posix 的 `posix-seed` 同时预埋预热数据并保存其参数与 seed，重启后的 `posix-run` 先从 Posix 加载这些独立前缀，再清理 HBM 并进入正式测试。每组预热使用不同 seed，使各组都能执行外部加载。自动 LB 模式覆盖所有 DP，固定 DP 模式覆盖指定 DP，预热阶段每次 bench 的并发为配置中的 `concurrency`。
+Cache 模式先预埋预热前缀、reset HBM，再向每个 DP 发送预热加载请求。Posix 的 `posix-seed` 同时预埋预热数据并保存其参数与 seed，重启后的 `posix-run` 先从 Posix 加载这些独立前缀，然后直接进入正式测试。每组预热使用不同 seed，使各组都能执行外部加载。自动 LB 模式覆盖所有 DP，固定 DP 模式覆盖指定 DP，预热阶段每次 bench 的并发为配置中的 `concurrency`。
 
 `enabled` 设为 `false` 可关闭加载预热。HBM 模式使用原有的公共前缀预热流程。Posix 重启后的预热参数和 seed 采用预埋记录中的值。历史预埋记录仍可继续测量，缺少预热数据时会提示本轮跳过加载预热，重新执行 `posix-seed` 可生成预热数据。
 
@@ -115,6 +117,8 @@ HBM 和 external 命中率来自 vLLM token 计数，按汇总后的分子与分
 ## 结果
 
 每次运行自动生成该轮及整个 results 目录的 `summary.csv`、`summary.xlsx`，并保存每个 case 的 bench JSON、日志、完整命令、seed 和实验 manifest。失败请求及 metrics 采集异常会保存在结果中，并使命令返回非零状态。
+
+终端汇总同时显示 Target hit、HBM hit、External hit、Host Ready、Posix bytes 以及 TTFT。实际 0 命中显示 `0.0%`。缺少数据的列显示 `n/a`，Metrics 列标明采集状态。`--collect-metrics` 启用正式测量窗口的实际命中率采集。
 
 可以重新汇总已有结果。
 

@@ -259,6 +259,61 @@ class WorkflowTest(unittest.TestCase):
         self.save_config()
         self.run_mode("posix-run", expected=1)
 
+    def test_posix_commands_preserve_original_a3_short_seed_full_measurement(self):
+        self.config["dp"] = 2
+        self.config["seed"] = 2004
+        self.config["cases"] = [
+            {
+                "input_len": 32768,
+                "output_len": 512,
+                "hit_rate": 0.9,
+                "concurrency": 40,
+                "num_requests": 40,
+            },
+            {
+                "input_len": 131072,
+                "output_len": 512,
+                "hit_rate": 0.9,
+                "concurrency": 10,
+                "num_requests": 10,
+            },
+        ]
+        self.save_config()
+        self.run_mode("posix-seed")
+        seed_commands = [command for kind, command in self.events if kind == "seed"]
+        self.events.clear()
+        self.run_mode("posix-run")
+        measured_commands = [
+            command for kind, command in self.events if kind == "measure"
+        ]
+        for index, (length, count, seed) in enumerate(
+            [(32768, 40, 2004), (131072, 10, 2005)]
+        ):
+            for rank in (0, 1):
+                command = seed_commands[index * 2 + rank]
+                for flag, value in [
+                    ("--random-input-len", length * 9 // 10),
+                    ("--random-prefix-len", 0),
+                    ("--random-output-len", 1),
+                    ("--num-prompts", count),
+                    ("--max-concurrency", count // 2),
+                    ("--seed", seed),
+                    ("--header", f"X-data-parallel-rank={rank}"),
+                ]:
+                    self.assertEqual(command[command.index(flag) + 1], str(value))
+            command = measured_commands[index]
+            for flag, value in [
+                ("--random-input-len", length),
+                ("--random-prefix-len", 0),
+                ("--random-output-len", 512),
+                ("--num-prompts", count),
+                ("--max-concurrency", count),
+                ("--seed", seed),
+            ]:
+                self.assertEqual(command[command.index(flag) + 1], str(value))
+            self.assertNotIn("--header", command)
+            self.assertEqual(command[:3], ["vllm", "bench", "serve"])
+
     def enable_load_warmup(self):
         self.config["ucm_warmup"] = {
             "enabled": True,
@@ -315,9 +370,8 @@ class WorkflowTest(unittest.TestCase):
         self.run_mode("posix-run", "--collect-metrics")
         measured = self.manifests("posix-run")[0]
         self.assertEqual(source["warmups"], measured["warmups"])
-        self.assertEqual(
-            [event[0] for event in self.events[:7]], ["warmup_load"] * 6 + ["reset"]
-        )
+        self.assertEqual([event[0] for event in self.events[:6]], ["warmup_load"] * 6)
+        self.assertFalse(any(kind == "reset" for kind, _ in self.events))
         expected_seeds = {str(group["seed"]) for group in source["warmups"]}
         actual_seeds = {
             command[command.index("--seed") + 1]
@@ -403,6 +457,42 @@ class WorkflowTest(unittest.TestCase):
 
 
 class MetricsTest(unittest.TestCase):
+    def test_console_summary_prints_real_zero_hits_and_missing_values(self):
+        from reporting import write_summary
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            sample = {
+                "mode": "posix",
+                "case": "sample",
+                "status": "complete",
+                "target_hit_rate": 0.9,
+                "hbm_hit_rate": 0.0,
+                "external_hit_rate": 0.0,
+                "host_ready_shard_fraction": None,
+                "posix_read_bytes": 0,
+                "ttft_mean_ms": 125,
+                "metrics_status": "captured",
+            }
+            (directory / "case_result.json").write_text(json.dumps(sample))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                write_summary(directory)
+            text = output.getvalue()
+            self.assertIn("Target hit", text)
+            self.assertIn("External hit", text)
+            self.assertIn("90.0%", text)
+            self.assertEqual(
+                [cell.strip() for cell in text.split("|")].count("0.0%"), 2
+            )
+            self.assertIn("n/a", text)
+
+    def test_console_summary_handles_empty_results(self):
+        from reporting import write_summary
+
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
+            self.assertEqual(write_summary(Path(temporary)), [])
+
     def test_counter_labels_resets_missing_and_zero(self):
         before = all_samples(
             collector, 'vllm:prefix_cache_hits_total{engine="0",model_name="test"} 5'
