@@ -72,6 +72,26 @@ python bench.py cache bench.json --dp-rank 0
 
 也可在配置中写入 `"routing": {"mode": "fixed", "rank": 0}`。固定模式的预埋与测量都指向同一个 DP，汇总表保留其路由范围。
 
+## UCM 加载预热
+
+Cache 和 Posix 命中测试在全部正式 case 之前增加独立的加载预热。默认在每个目标 DP 上执行两组，每组 8K 输入、4 请求、4 并发、约 90% 前缀命中、输出 1 token。预热数据使用独立 seed，日志和 bench JSON 放在该轮的 `warmup_001/` 等目录中，正式汇总及 metrics 采集窗口从后续正式 case 开始。
+
+```json
+"ucm_warmup": {
+  "enabled": true,
+  "rounds": 2,
+  "input_len": 8192,
+  "output_len": 1,
+  "hit_rate": 0.9,
+  "concurrency": 4,
+  "num_requests": 4
+}
+```
+
+Cache 模式先预埋预热前缀、reset HBM，再向每个 DP 发送预热加载请求。Posix 的 `posix-seed` 同时预埋预热数据并保存其参数与 seed，重启后的 `posix-run` 先从 Posix 加载这些独立前缀，再清理 HBM 并进入正式测试。每组预热使用不同 seed，使各组都能执行外部加载。自动 LB 模式覆盖所有 DP，固定 DP 模式覆盖指定 DP，预热阶段每次 bench 的并发为配置中的 `concurrency`。
+
+`enabled` 设为 `false` 可关闭加载预热。HBM 模式使用原有的公共前缀预热流程。Posix 重启后的预热参数和 seed 采用预埋记录中的值。历史预埋记录仍可继续测量，缺少预热数据时会提示本轮跳过加载预热，重新执行 `posix-seed` 可生成预热数据。
+
 ## 可选 metrics
 
 添加 `--collect-metrics` 即可采集正式命中轮次。

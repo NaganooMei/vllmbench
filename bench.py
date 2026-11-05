@@ -42,6 +42,25 @@ def positive_integer(value, name: str, minimum: int = 1) -> int:
     return value
 
 
+def normalize_case(case: dict, label: str, block: int) -> None:
+    if not isinstance(case, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    for field in ("input_len", "output_len", "concurrency", "num_requests"):
+        positive_integer(case.get(field), f"{label} {field}")
+    try:
+        hit_rate = Decimal(str(case["hit_rate"]))
+    except (KeyError, InvalidOperation) as error:
+        raise ValueError(f"{label} requires a hit_rate between 0 and 1") from error
+    if not hit_rate.is_finite() or not 0 <= hit_rate <= 1:
+        raise ValueError(f"{label} hit_rate must be between 0 and 1")
+    if case["concurrency"] > case["num_requests"]:
+        raise ValueError(f"{label} concurrency exceeds num_requests")
+    # Leave a token for vLLM's normal final-token recomputation at 100%.
+    available = min(int(case["input_len"] * hit_rate), case["input_len"] - 1)
+    case["seed_tokens"] = available // block * block
+    case["hit_rate"] = float(hit_rate)
+
+
 def load_config(path: Path, args) -> dict:
     config = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
@@ -85,27 +104,35 @@ def load_config(path: Path, args) -> dict:
     if not isinstance(cases, list) or not cases:
         raise ValueError("cases must be a non-empty list")
     for index, case in enumerate(cases, start=1):
-        if not isinstance(case, dict):
-            raise ValueError(f"case {index} must be a JSON object")
-        for field in ("input_len", "output_len", "concurrency", "num_requests"):
-            positive_integer(case.get(field), f"case {index} {field}")
-        try:
-            hit_rate = Decimal(str(case["hit_rate"]))
-        except (KeyError, InvalidOperation) as error:
-            raise ValueError(
-                f"case {index} requires a hit_rate between 0 and 1"
-            ) from error
-        if not hit_rate.is_finite() or not 0 <= hit_rate <= 1:
-            raise ValueError(f"case {index} hit_rate must be between 0 and 1")
-        if case["concurrency"] > case["num_requests"]:
-            raise ValueError(f"case {index} concurrency exceeds num_requests")
-        block = config["block_tokens"]
-        # Leave a token for vLLM's normal final-token recomputation at 100%.
-        available = min(int(case["input_len"] * hit_rate), case["input_len"] - 1)
-        case["seed_tokens"] = available // block * block
-        case["hit_rate"] = float(hit_rate)
+        normalize_case(case, f"case {index}", config["block_tokens"])
         case["name"] = (
             f"{index:03d}_{case['input_len']}in_{case['output_len']}out_c{case['concurrency']}_n{case['num_requests']}"
+        )
+    warmup = config.setdefault("ucm_warmup", {})
+    if not isinstance(warmup, dict):
+        raise ValueError("ucm_warmup must be a JSON object")
+    warmup.setdefault("enabled", True)
+    if not isinstance(warmup["enabled"], bool):
+        raise ValueError("ucm_warmup.enabled must be true or false")
+    defaults = {
+        "rounds": 2,
+        "input_len": 8192,
+        "output_len": 1,
+        "hit_rate": 0.9,
+        "concurrency": 4,
+        "num_requests": 4,
+    }
+    for field, default in defaults.items():
+        warmup.setdefault(field, default)
+    positive_integer(warmup["rounds"], "ucm_warmup.rounds")
+    normalize_case(warmup, "ucm_warmup", config["block_tokens"])
+    if (
+        warmup["enabled"]
+        and args.mode in ("cache", "posix-seed")
+        and warmup["seed_tokens"] == 0
+    ):
+        raise ValueError(
+            "ucm_warmup requires at least one cached block to exercise loading"
         )
     metrics = config.setdefault("metrics", {})
     if not isinstance(metrics, dict):
@@ -144,7 +171,12 @@ def load_config(path: Path, args) -> dict:
     )
     if "seed" in config and config["seed"] != "random":
         seed = positive_integer(config["seed"], "seed", 0)
-        if seed + len(cases) - 1 >= 2**32:
+        offsets = len(cases) + (
+            warmup["rounds"]
+            if warmup["enabled"] and args.mode in ("cache", "posix-seed")
+            else 0
+        )
+        if seed + offsets - 1 >= 2**32:
             raise ValueError("seed and its case offsets must fit in 32 bits")
     return config
 
@@ -374,6 +406,7 @@ class Experiment:
         self.key = fingerprint(config)
         self.pointer = self.root / f".posix_pending_{self.key}.json"
         self.seed_source = None
+        self.warmups = []
         if self.mode == "posix-run":
             if args.run:
                 self.seed_source = Path(args.run).resolve()
@@ -391,10 +424,21 @@ class Experiment:
                     "Posix seed configuration changed or pre-seeding did not complete"
                 )
             self.cases = source["cases"]
+            if config["ucm_warmup"]["enabled"]:
+                self.warmups = source.get("warmups", [])
+                if not self.warmups:
+                    print(
+                        "This older Posix seed run has no load warmup data. Rerun posix-seed to enable load warmup."
+                    )
         else:
             self.cases = [dict(case) for case in config["cases"]]
+            if self.mode != "hbm" and config["ucm_warmup"]["enabled"]:
+                for index in range(config["ucm_warmup"]["rounds"]):
+                    warmup = dict(config["ucm_warmup"])
+                    warmup["name"] = f"warmup_{index + 1:03d}"
+                    self.warmups.append(warmup)
             used = set()
-            for index, case in enumerate(self.cases):
+            for index, case in enumerate([*self.cases, *self.warmups]):
                 seed = config.get("seed", "random")
                 if seed == "random":
                     seed = secrets.randbelow(2**32)
@@ -414,6 +458,8 @@ class Experiment:
             "fingerprint": self.key,
             "config": config,
             "cases": self.cases,
+            "warmups": self.warmups,
+            "warmup_status": {},
             "seed_source": str(self.seed_source) if self.seed_source else None,
             "status": "running",
             "case_status": {},
@@ -454,6 +500,46 @@ class Experiment:
             if self.config["metrics"]["enabled"]:
                 settle = max(settle, self.config["metrics"]["settle_seconds"])
             time.sleep(settle)
+
+    def run_ucm_warmup(self) -> None:
+        for warmup in self.warmups:
+            directory = self.directory / warmup["name"]
+            print(
+                f"\nUCM load warmup {warmup['name']} seed={warmup['seed']}", flush=True
+            )
+            if self.mode != "posix-run":
+                self.seed_case(warmup, directory)
+            if self.mode != "posix-seed":
+                if self.mode == "cache":
+                    reset_prefix(self.config, self.args.dry_run)
+                for rank in self.ranks():
+                    result = self.cli.run(
+                        warmup,
+                        directory,
+                        f"warmup_load_dp{rank}",
+                        warmup["input_len"],
+                        0,
+                        warmup["output_len"],
+                        warmup["concurrency"],
+                        rank,
+                    )
+                    if result.get("validation_errors"):
+                        raise RuntimeError(
+                            f"UCM load warmup failed on DP{rank}: {result['validation_errors']}"
+                        )
+                if not self.args.dry_run:
+                    time.sleep(
+                        max(
+                            self.config["seed_settle_seconds"],
+                            self.config["metrics"]["settle_seconds"],
+                        )
+                    )
+            self.manifest["warmup_status"][warmup["name"]] = (
+                "seeded" if self.mode == "posix-seed" else "complete"
+            )
+            self.save()
+        if self.warmups and self.mode == "posix-run":
+            reset_prefix(self.config, self.args.dry_run)
 
     def measure_case(self, case: dict, directory: Path) -> None:
         routing = self.config["routing"]
@@ -540,6 +626,7 @@ class Experiment:
         try:
             if not self.args.dry_run:
                 http_request(self.config["base_url"] + "/health")
+            self.run_ucm_warmup()
             for case in self.cases:
                 directory = self.directory / case["name"]
                 print(

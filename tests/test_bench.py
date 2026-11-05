@@ -75,6 +75,7 @@ class WorkflowTest(unittest.TestCase):
             "served_model": "test",
             "dp": 3,
             "seed_settle_seconds": 0,
+            "ucm_warmup": {"enabled": False},
             "metrics": {"enabled": False, "settle_seconds": 0},
             "results_dir": str(self.root / "results"),
             "cases": [
@@ -138,9 +139,11 @@ class WorkflowTest(unittest.TestCase):
         length = int(option("--random-input-len")) + int(option("--random-prefix-len"))
         output = int(option("--random-output-len"))
         measured = option("--result-filename") == "measure.json"
-        self.events.append(("measure" if measured else "seed", list(command)))
+        warmup_load = option("--result-filename").startswith("warmup_load")
+        kind = "measure" if measured else ("warmup_load" if warmup_load else "seed")
+        self.events.append((kind, list(command)))
         self.queries += count * length
-        if measured:
+        if measured or warmup_load:
             self.external += count * int(length * 0.9)
             self.shards += count
             self.load_observations += 1
@@ -255,6 +258,84 @@ class WorkflowTest(unittest.TestCase):
         self.config["cases"][0]["num_requests"] += 1
         self.save_config()
         self.run_mode("posix-run", expected=1)
+
+    def enable_load_warmup(self):
+        self.config["ucm_warmup"] = {
+            "enabled": True,
+            "rounds": 2,
+            "input_len": 8192,
+            "output_len": 1,
+            "hit_rate": 0.9,
+            "concurrency": 4,
+            "num_requests": 4,
+        }
+        self.save_config()
+
+    def test_cache_load_warmup_covers_all_dp_before_metrics(self):
+        self.enable_load_warmup()
+        self.run_mode("cache", "--collect-metrics")
+        kinds = [event[0] for event in self.events]
+        self.assertEqual(
+            kinds[:14],
+            ["seed"] * 3
+            + ["reset"]
+            + ["warmup_load"] * 3
+            + ["seed"] * 3
+            + ["reset"]
+            + ["warmup_load"] * 3,
+        )
+        self.assertGreater(
+            kinds.index("snapshot"),
+            max(index for index, kind in enumerate(kinds) if kind == "warmup_load"),
+        )
+        manifest = self.manifests("cache")[0]
+        self.assertEqual(len(manifest["warmups"]), 2)
+        seeds = [case["seed"] for case in manifest["cases"] + manifest["warmups"]]
+        self.assertEqual(len(set(seeds)), 4)
+        rows = [
+            json.loads(path.read_text())
+            for path in (self.root / "results").rglob("case_result.json")
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["external_hit_rate"] == 0.9 for row in rows))
+        loads = [event[1] for event in self.events if event[0] == "warmup_load"]
+        self.assertEqual(len(loads), 6)
+        for command in loads:
+            self.assertEqual(command[command.index("--random-input-len") + 1], "8192")
+            self.assertEqual(command[command.index("--max-concurrency") + 1], "4")
+
+    def test_posix_warmup_is_seeded_before_restart_and_replayed_after(self):
+        self.enable_load_warmup()
+        self.run_mode("posix-seed")
+        source = self.manifests("posix-seed")[0]
+        self.assertEqual(len(source["warmups"]), 2)
+        self.assertEqual(len(self.events), 12)
+        self.assertTrue(all(event[0] == "seed" for event in self.events))
+        self.events.clear()
+        self.run_mode("posix-run", "--collect-metrics")
+        measured = self.manifests("posix-run")[0]
+        self.assertEqual(source["warmups"], measured["warmups"])
+        self.assertEqual(
+            [event[0] for event in self.events[:7]], ["warmup_load"] * 6 + ["reset"]
+        )
+        expected_seeds = {str(group["seed"]) for group in source["warmups"]}
+        actual_seeds = {
+            command[command.index("--seed") + 1]
+            for kind, command in self.events
+            if kind == "warmup_load"
+        }
+        self.assertEqual(expected_seeds, actual_seeds)
+
+    def test_legacy_posix_manifest_remains_usable_without_warmup_data(self):
+        self.run_mode("posix-seed")
+        path = next((self.root / "results").glob("*_posix-seed_*/manifest.json"))
+        manifest = json.loads(path.read_text())
+        manifest.pop("warmups")
+        path.write_text(json.dumps(manifest))
+        self.enable_load_warmup()
+        self.events.clear()
+        self.run_mode("posix-run")
+        self.assertEqual([event[0] for event in self.events], ["measure", "measure"])
 
     def test_failed_measurement_is_saved_and_returns_failure(self):
         self.fail_measurement = True
