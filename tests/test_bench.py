@@ -38,6 +38,7 @@ class WorkflowTest(unittest.TestCase):
         self.shards = 0
         self.load_observations = 0
         self.fail_measurement = False
+        self.metrics_unavailable = False
         self.reset_failures = 0
         owner = self
 
@@ -47,6 +48,9 @@ class WorkflowTest(unittest.TestCase):
                     body = b"healthy"
                 elif self.path == "/metrics":
                     owner.events.append(("snapshot", owner.queries))
+                    if owner.metrics_unavailable:
+                        self.send_error(404)
+                        return
                     body = owner.metrics().encode()
                 else:
                     self.send_error(404)
@@ -235,6 +239,8 @@ class WorkflowTest(unittest.TestCase):
             manifests[0]["cases"][0]["seed"], manifests[1]["cases"][0]["seed"]
         )
         for kind, command in self.events:
+            if kind not in ("seed", "measure"):
+                continue
             self.assertEqual(
                 command[command.index("--header") + 1], "X-data-parallel-rank=1"
             )
@@ -389,7 +395,62 @@ class WorkflowTest(unittest.TestCase):
         self.enable_load_warmup()
         self.events.clear()
         self.run_mode("posix-run")
-        self.assertEqual([event[0] for event in self.events], ["measure", "measure"])
+        self.assertEqual(
+            [event[0] for event in self.events], ["snapshot", "measure", "snapshot"] * 2
+        )
+
+    def test_default_hit_rates_exclude_seeding_without_detailed_exports(self):
+        self.run_mode("cache")
+        rows = [
+            json.loads(path.read_text())
+            for path in (self.root / "results").rglob("case_result.json")
+        ]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["hbm_hit_rate"], 0)
+            self.assertEqual(row["external_hit_rate"], 0.9)
+            self.assertEqual(row["metrics_status"], "hit counters")
+            self.assertFalse((Path(row["measurement_dir"]) / "metrics").exists())
+        self.assertEqual(
+            [kind for kind, _ in self.events],
+            ["seed", "seed", "seed", "reset", "snapshot", "measure", "snapshot"] * 2,
+        )
+        summary = (self.root / "results" / "summary.csv").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn("external_hit_rate", summary)
+        self.assertIn("0.9", summary)
+
+    def test_default_hit_counter_failure_does_not_stop_bench(self):
+        self.metrics_unavailable = True
+        self.run_mode("cache")
+        rows = [
+            json.loads(path.read_text())
+            for path in (self.root / "results").rglob("case_result.json")
+        ]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["status"], "complete")
+            self.assertNotIn("external_hit_rate", row)
+            self.assertIn("hit counters unavailable", row["metrics_status"])
+            self.assertTrue(Path(row["bench_result_path"]).exists())
+
+    def test_default_hit_counter_failure_after_bench_preserves_success(self):
+        from metrics_capture import MetricsCapture
+
+        with mock.patch.object(
+            MetricsCapture, "finish", side_effect=RuntimeError("endpoint unavailable")
+        ):
+            self.run_mode("cache")
+        rows = [
+            json.loads(path.read_text())
+            for path in (self.root / "results").rglob("case_result.json")
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["status"] == "complete" for row in rows))
+        self.assertTrue(
+            all("endpoint unavailable" in row["metrics_status"] for row in rows)
+        )
 
     def test_failed_measurement_is_saved_and_returns_failure(self):
         self.fail_measurement = True

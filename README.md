@@ -50,7 +50,7 @@ python bench.py cache bench.json
 
 每个 case 的全部请求前缀会在每个 DP 都预埋一遍，然后调用 `POST /reset_prefix_cache?reset_external=false`，清理 HBM 前缀缓存，接着测量。每个 DP 的 Host Cache 需要容纳该 case 的完整预埋集合。reset 返回失败时自动重试至超时。
 
-内部 LB 会把 reset 广播到全部 DP。本地核对的 vLLM 版本只返回第一个 DP 的 reset 结果，开启 metrics 后还应检查测量窗口中的实际 HBM 命中。
+内部 LB 会把 reset 广播到全部 DP。本地核对的 vLLM 版本只返回第一个 DP 的 reset 结果，还应检查测量窗口中的实际 HBM 命中。
 
 ## UCM Posix 命中
 
@@ -96,9 +96,9 @@ Cache 模式先预埋预热前缀、reset HBM，再向每个 DP 发送预热加�
 
 ## 可选 metrics
 
-添加 `--collect-metrics` 即可采集正式命中轮次。
+默认就会在每个正式 case 前后各读取一次 `/metrics`，用计数器增量计算 HBM 和 external 实际命中率，打印到终端并写入汇总 CSV、Excel。不需要添加 `--collect-metrics`，也不导出详细快照或耗时分布。该默认读取失败时显示 `n/a` 和原因，性能测试继续执行。
 
-服务需要开放 `/metrics`，UCM 的分层统计和耗时分布需要服务端启用相应的 UCM metrics。客户端采集选项控制本轮快照与报表导出。
+实际命中率需要服务开放 `/metrics` 并提供对应的 vLLM prefix cache 计数。添加 `--collect-metrics` 才启用详细快照和报表导出；UCM 的分层统计和耗时分布需要服务端启用相应的 UCM metrics。
 
 ```bash
 python bench.py hbm bench.json --collect-metrics
@@ -106,9 +106,9 @@ python bench.py cache bench.json --collect-metrics
 python bench.py posix-run bench.json --collect-metrics
 ```
 
-预热、预埋完成后至少等待 `metrics.settle_seconds`，reset 完成后采集 before 快照，正式 bench 完成后等待同样的时间再采集 after 快照。请按服务的指标发布周期设置等待时间。采集窗口应使用空闲的专用测试服务，避免其他请求混入。
+默认命中率统计和详细采集都只覆盖正式测量窗口。预热、预埋完成后至少等待 `metrics.settle_seconds`，Cache 模式 reset 完成后读取 before 计数，正式 bench 完成后等待同样的时间再读取 after 计数。请按服务的指标发布周期设置等待时间。采集窗口应使用空闲的专用测试服务，避免其他请求混入。
 
-每个 case 的 `metrics/` 包含原始及过滤后的 Prometheus 快照、按 rank 的 Connector/CacheStore/Posix CSV 与 Excel 报表、直方图增量 avg/p90/p99、命中率 JSON。metrics 关闭时仍输出 bench 性能表，实际命中率列保留为空。
+启用详细采集时，每个 case 的 `metrics/` 包含原始及过滤后的 Prometheus 快照、按 rank 的 Connector/CacheStore/Posix CSV 与 Excel 报表、直方图增量 avg/p90/p99、命中率 JSON。不开详细采集时，实际命中率仍保存在 `case_result.json` 和汇总表中。
 
 复用了用户 UCM 分支中的 `scripts/collect_ucm_metrics.py`，来源提交为 `3f83ab3ee73fce8fc20c9194eb6f642b3c7c491d`。仓库内的 `collect_ucm_metrics.py` 保持来源文件内容。配置中的 `metrics.collector_path` 可以指向具有相同导出 API 的新版脚本。
 
@@ -116,9 +116,9 @@ HBM 和 external 命中率来自 vLLM token 计数，按汇总后的分子与分
 
 ## 结果
 
-每次运行自动生成该轮及整个 results 目录的 `summary.csv`、`summary.xlsx`，并保存每个 case 的 bench JSON、日志、完整命令、seed 和实验 manifest。失败请求及 metrics 采集异常会保存在结果中，并使命令返回非零状态。
+每次运行自动生成该轮及整个 results 目录的 `summary.csv`、`summary.xlsx`，并保存每个 case 的 bench JSON、日志、完整命令、seed 和实验 manifest。失败请求及显式启用的详细 metrics 采集异常会保存在结果中，并使命令返回非零状态。默认轻量计数读取异常只标记命中率不可用。
 
-终端汇总同时显示 Target hit、HBM hit、External hit、Host Ready、Posix bytes 以及 TTFT。实际 0 命中显示 `0.0%`。缺少数据的列显示 `n/a`，Metrics 列标明采集状态。`--collect-metrics` 启用正式测量窗口的实际命中率采集。
+终端汇总同时显示 Target hit、HBM hit、External hit、Host Ready、Posix bytes 以及 TTFT。实际 0 命中显示 `0.0%`。缺少数据的列显示 `n/a`，Metrics 列标明计数读取或详细采集状态。
 
 可以重新汇总已有结果。
 

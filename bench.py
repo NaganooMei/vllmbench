@@ -496,10 +496,12 @@ class Experiment:
                     f"Pre-seeding failed for {case['name']} DP{rank}: {result['validation_errors']}"
                 )
         if not self.args.dry_run:
-            settle = self.config["seed_settle_seconds"]
-            if self.config["metrics"]["enabled"]:
-                settle = max(settle, self.config["metrics"]["settle_seconds"])
-            time.sleep(settle)
+            time.sleep(
+                max(
+                    self.config["seed_settle_seconds"],
+                    self.config["metrics"]["settle_seconds"],
+                )
+            )
 
     def run_ucm_warmup(self) -> None:
         for warmup in self.warmups:
@@ -561,7 +563,7 @@ class Experiment:
             },
             "target_hit_rate": case["hit_rate"],
             "status": "failed",
-            "metrics_status": "disabled",
+            "metrics_status": "not started",
             "measurement_dir": str(directory),
         }
         if self.mode == "hbm" and case["seed_tokens"]:
@@ -572,9 +574,16 @@ class Experiment:
         capture = None
         result = {}
         try:
-            if self.config["metrics"]["enabled"] and not self.args.dry_run:
-                capture = MetricsCapture(directory / "metrics", self.config["metrics"])
-                capture.start()
+            if not self.args.dry_run:
+                try:
+                    capture = MetricsCapture(
+                        directory / "metrics", self.config["metrics"]
+                    )
+                    capture.start()
+                except Exception as error:
+                    row["metrics_status"] = f"hit counters unavailable: {error}"
+                    if self.config["metrics"]["enabled"]:
+                        raise
             result = self.cli.run(
                 case,
                 directory,
@@ -600,8 +609,11 @@ class Experiment:
                             )
                         )
                     except Exception as error:
-                        row["metrics_status"] = f"collection failed: {error}"
-                        row["status"] = "failed"
+                        if self.config["metrics"]["enabled"]:
+                            row["metrics_status"] = f"collection failed: {error}"
+                            row["status"] = "failed"
+                        else:
+                            row["metrics_status"] = f"hit counters unavailable: {error}"
                 elif self.config["metrics"]["enabled"]:
                     row["metrics_status"] = "collection did not start"
                 directory.mkdir(parents=True, exist_ok=True)

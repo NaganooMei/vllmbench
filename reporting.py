@@ -309,10 +309,6 @@ def write_summary(directory: Path) -> list[dict]:
     ]
     for row in [headers, *table]:
         print(" | ".join(value.ljust(width) for value, width in zip(row, widths)))
-    if any(result.get("metrics_status") == "disabled" for result in results):
-        print(
-            "Actual hit rates are n/a when metrics collection is disabled. Add --collect-metrics to capture them."
-        )
     print(
         f"Summary saved to {directory / 'summary.csv'} and {directory / 'summary.xlsx'}"
     )

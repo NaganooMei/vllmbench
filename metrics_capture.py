@@ -80,32 +80,48 @@ class MetricsCapture:
     def __init__(self, directory: Path, config: dict):
         self.directory = directory
         self.config = config
-        self.module = load_collector(config.get("collector_path"))
-        self.directory.mkdir(parents=True)
+        self.detailed = config["enabled"]
+        self.module = load_collector(
+            config.get("collector_path") if self.detailed else None
+        )
+        if self.detailed:
+            self.directory.mkdir(parents=True)
+
+    def snapshot(self, label: str) -> tuple[str, dict]:
+        if self.detailed:
+            return self.module.save_snapshot(
+                self.directory,
+                label,
+                self.config["url"],
+                self.config["timeout_seconds"],
+            )
+        return (
+            collect_ucm_metrics.fetch_metrics(
+                self.config["url"], self.config["timeout_seconds"]
+            ),
+            {},
+        )
 
     def start(self) -> None:
         self.start_time = time.monotonic()
-        self.before_text, self.before = self.module.save_snapshot(
-            self.directory, "before", self.config["url"], self.config["timeout_seconds"]
-        )
+        self.before_text, self.before = self.snapshot("before")
 
     def finish(self, models: set[str]) -> dict:
         time.sleep(self.config["settle_seconds"])
-        after_text, after = self.module.save_snapshot(
-            self.directory, "after", self.config["url"], self.config["timeout_seconds"]
-        )
+        after_text, after = self.snapshot("after")
         elapsed = time.monotonic() - self.start_time
-        report = self.module.write_delta_report(
-            self.directory / "metrics_report.md",
-            self.before,
-            after,
-            elapsed,
-            False,
-            report_stem="metrics_report",
-        )
-        (self.directory / "summary.json").write_text(
-            json.dumps(report, indent=2) + "\n", encoding="utf-8"
-        )
+        if self.detailed:
+            report = self.module.write_delta_report(
+                self.directory / "metrics_report.md",
+                self.before,
+                after,
+                elapsed,
+                False,
+                report_stem="metrics_report",
+            )
+            (self.directory / "summary.json").write_text(
+                json.dumps(report, indent=2) + "\n", encoding="utf-8"
+            )
         before_all = all_samples(self.module, self.before_text)
         after_all = all_samples(self.module, after_text)
 
@@ -129,10 +145,13 @@ class MetricsCapture:
             "backend_load_shards": delta("ucm:cache_load_backend_shards_total"),
             "posix_read_bytes": delta("ucm:posix_s2h_bytes_total"),
             "metrics_status": (
-                "captured" if queries is not None else "prefix counters unavailable"
+                ("captured" if self.detailed else "hit counters")
+                if queries is not None
+                else "prefix counters unavailable"
             ),
         }
-        (self.directory / "hit_rates.json").write_text(
-            json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-        )
+        if self.detailed:
+            (self.directory / "hit_rates.json").write_text(
+                json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+            )
         return summary
