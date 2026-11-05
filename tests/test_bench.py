@@ -160,6 +160,7 @@ class WorkflowTest(unittest.TestCase):
             "latencies": [0.4] * count,
             "duration": 1.0,
             "output_throughput": count * output,
+            "total_token_throughput": count * (length + output),
         }
         path = Path(option("--result-dir")) / option("--result-filename")
         path.write_text(json.dumps(result), encoding="utf-8")
@@ -410,6 +411,14 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(row["hbm_hit_rate"], 0)
             self.assertEqual(row["external_hit_rate"], 0.9)
             self.assertEqual(row["metrics_status"], "hit counters")
+            self.assertAlmostEqual(row["tpot_mean_ms"], 100)
+            self.assertEqual(
+                row["output_tokens_per_s"], row["num_requests"] * row["output_len"]
+            )
+            self.assertEqual(
+                row["total_tokens_per_s"],
+                row["num_requests"] * (row["input_len"] + row["output_len"]),
+            )
             self.assertFalse((Path(row["measurement_dir"]) / "metrics").exists())
         self.assertEqual(
             [kind for kind, _ in self.events],
@@ -567,11 +576,38 @@ class ExperimentLockTest(unittest.TestCase):
 
 
 class MetricsTest(unittest.TestCase):
+    def test_performance_records_tpot_and_vllm_throughputs(self):
+        from reporting import performance
+
+        result = performance(
+            {
+                "ttfts": [0.1, 0.1],
+                "latencies": [0.6, 0.7],
+                "output_lens": [6, 4],
+                "duration": 2,
+                "output_throughput": 5,
+                "total_token_throughput": 105,
+            }
+        )
+        self.assertAlmostEqual(result["tpot_mean_ms"], 150)
+        self.assertEqual(result["output_tokens_per_s"], 5)
+        self.assertEqual(result["total_tokens_per_s"], 105)
+
     def test_console_summary_prints_real_zero_hits_and_missing_values(self):
         from reporting import write_summary
 
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
+            raw = directory / "measure.json"
+            raw.write_text(
+                json.dumps(
+                    {
+                        "mean_tpot_ms": 5,
+                        "output_throughput": 6000,
+                        "total_token_throughput": 7000,
+                    }
+                )
+            )
             sample = {
                 "mode": "posix",
                 "case": "sample",
@@ -583,14 +619,32 @@ class MetricsTest(unittest.TestCase):
                 "posix_read_bytes": 0,
                 "ttft_mean_ms": 125,
                 "metrics_status": "captured",
+                "bench_result_path": str(raw),
             }
             (directory / "case_result.json").write_text(json.dumps(sample))
             output = io.StringIO()
             with redirect_stdout(output):
-                write_summary(directory)
+                rows = write_summary(directory)
             text = output.getvalue()
             self.assertIn("Target hit", text)
             self.assertIn("External hit", text)
+            self.assertIn("TPOT ms", text)
+            self.assertIn("Output tok/s", text)
+            self.assertIn("Total tok/s", text)
+            self.assertIn("5.00", text)
+            self.assertIn("6000.00", text)
+            self.assertIn("7000.00", text)
+            self.assertEqual(rows[0]["total_tokens_per_s"], 7000)
+            self.assertEqual(rows[0]["ttft_mean_ms"], 125)
+            self.assertIn(
+                "total_tokens_per_s",
+                (directory / "summary.csv").read_text(encoding="utf-8-sig"),
+            )
+            with zipfile.ZipFile(directory / "summary.xlsx") as workbook:
+                self.assertIn(
+                    "total_tokens_per_s",
+                    workbook.read("xl/worksheets/sheet1.xml").decode(),
+                )
             self.assertIn("90.0%", text)
             self.assertEqual(
                 [cell.strip() for cell in text.split("|")].count("0.0%"), 2

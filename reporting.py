@@ -37,6 +37,7 @@ FIELDS = (
     "tpot_mean_ms",
     "duration_s",
     "output_tokens_per_s",
+    "total_tokens_per_s",
     "hbm_hit_rate",
     "external_hit_rate",
     "external_hit_rate_remaining",
@@ -48,6 +49,18 @@ FIELDS = (
 )
 RATE_FIELDS = {name for name in FIELDS if "rate" in name or "fraction" in name}
 DEFINITIONS = (
+    (
+        "TPOT mean ms",
+        "Mean per-request time per output token after the first token, in milliseconds.",
+    ),
+    (
+        "Output tokens/s",
+        "vLLM output_throughput: successful output tokens / benchmark duration.",
+    ),
+    (
+        "Total tokens/s",
+        "vLLM total_token_throughput: successful input plus output tokens / benchmark duration. Includes cached input tokens.",
+    ),
     ("HBM hit rate", "HBM cached tokens / queried HBM prefix tokens."),
     ("External hit rate", "External cached tokens / queried HBM prefix tokens."),
     (
@@ -116,6 +129,7 @@ def performance(result: dict) -> dict:
         ),
         "duration_s": result.get("duration"),
         "output_tokens_per_s": result.get("output_throughput"),
+        "total_tokens_per_s": result.get("total_token_throughput"),
     }
 
 
@@ -258,6 +272,20 @@ def write_summary(directory: Path) -> list[dict]:
         json.loads(path.read_text(encoding="utf-8"))
         for path in sorted(directory.rglob("case_result.json"))
     ]
+    # Older case summaries omitted total throughput; recover it from bench JSON.
+    for result in results:
+        missing = [
+            field
+            for field in ("tpot_mean_ms", "output_tokens_per_s", "total_tokens_per_s")
+            if result.get(field) is None
+        ]
+        source = result.get("bench_result_path")
+        if missing and source and Path(source).is_file():
+            recovered = performance(
+                json.loads(Path(source).read_text(encoding="utf-8"))
+            )
+            for field in missing:
+                result[field] = recovered.get(field)
     rows = [[result.get(field) for field in FIELDS] for result in results]
     with (directory / "summary.csv").open(
         "w", encoding="utf-8-sig", newline=""
@@ -275,12 +303,18 @@ def write_summary(directory: Path) -> list[dict]:
         "Host Ready",
         "Posix bytes",
         "TTFT ms",
+        "TPOT ms",
+        "Output tok/s",
+        "Total tok/s",
         "Status",
         "Metrics",
     )
     table = []
     for result in results:
         ttft = result.get("ttft_mean_ms")
+        tpot = result.get("tpot_mean_ms")
+        output_throughput = result.get("output_tokens_per_s")
+        total_throughput = result.get("total_tokens_per_s")
         values = [
             result.get(field)
             for field in (
@@ -299,6 +333,9 @@ def write_summary(directory: Path) -> list[dict]:
                 *rates,
                 f"{posix_bytes:,.0f}" if posix_bytes is not None else "n/a",
                 f"{ttft:.2f}" if ttft is not None else "n/a",
+                f"{tpot:.2f}" if tpot is not None else "n/a",
+                f"{output_throughput:.2f}" if output_throughput is not None else "n/a",
+                f"{total_throughput:.2f}" if total_throughput is not None else "n/a",
                 result["status"],
                 result.get("metrics_status", "unavailable"),
             )
