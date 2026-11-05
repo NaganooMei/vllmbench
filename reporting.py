@@ -18,6 +18,7 @@ FIELDS = (
     "run_id",
     "mode",
     "case",
+    "served_model",
     "routing",
     "dp",
     "input_len",
@@ -268,10 +269,15 @@ def write_workbook(path: Path, headers: tuple, rows: list) -> None:
 
 
 def write_summary(directory: Path) -> list[dict]:
-    results = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted(directory.rglob("case_result.json"))
-    ]
+    results = []
+    for path in sorted(directory.rglob("case_result.json")):
+        result = json.loads(path.read_text(encoding="utf-8"))
+        if not result.get("served_model"):
+            manifest = path.parent.parent / "manifest.json"
+            if manifest.is_file():
+                saved = json.loads(manifest.read_text(encoding="utf-8"))
+                result["served_model"] = saved.get("config", {}).get("served_model")
+        results.append(result)
     # Older case summaries omitted total throughput; recover it from bench JSON.
     for result in results:
         missing = [
@@ -297,6 +303,7 @@ def write_summary(directory: Path) -> list[dict]:
     headers = (
         "Mode",
         "Case",
+        "Model",
         "Target hit",
         "HBM hit",
         "External hit",
@@ -330,6 +337,7 @@ def write_summary(directory: Path) -> list[dict]:
             (
                 result["mode"],
                 result["case"],
+                result.get("served_model") or "n/a",
                 *rates,
                 f"{posix_bytes:,.0f}" if posix_bytes is not None else "n/a",
                 f"{ttft:.2f}" if ttft is not None else "n/a",

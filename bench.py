@@ -615,6 +615,7 @@ class Experiment:
             "run_id": self.run_id,
             "mode": self.mode.removesuffix("-run"),
             "case": case["name"],
+            "served_model": self.config["served_model"],
             "routing": routing["mode"]
             + (f"_dp{routing['rank']}" if routing["mode"] == "fixed" else ""),
             "dp": self.config["dp"],

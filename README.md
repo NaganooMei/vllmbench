@@ -118,6 +118,8 @@ HBM 和 external 命中率来自 vLLM token 计数，按汇总后的分子与分
 
 每次运行自动生成该轮及整个 results 目录的 `summary.csv`、`summary.xlsx`，并保存每个 case 的 bench JSON、日志、完整命令、seed 和实验 manifest。失败请求及显式启用的详细 metrics 采集异常会保存在结果中，并使命令返回非零状态。默认轻量计数读取异常只标记命中率不可用。
 
+终端的 `Model` 列和 CSV、Excel 的 `served_model` 列使用本轮 `bench.json` 的 `served_model`。重新汇总旧结果时，会从该轮保存的 `manifest.json` 恢复模型名称。
+
 终端和 CSV、Excel 汇总同时记录 TTFT、TPOT（均值，单位 ms）、输出吞吐量 `Output tok/s` 和总 token 吞吐量 `Total tok/s`。总吞吐量使用 vLLM 的 `total_token_throughput`，即成功请求的输入加输出 token 数除以正式 bench 时长，输入包含命中的缓存 token；输出吞吐量单独展示。上述性能指标无需开启 `--collect-metrics`。
 
 终端还显示 Target hit、HBM hit、External hit、Host Ready 和 Posix bytes。实际 0 命中显示 `0.0%`。缺少数据的列显示 `n/a`，Metrics 列标明计数读取或详细采集状态。
