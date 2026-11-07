@@ -38,7 +38,9 @@ UCM 预埋直接把 `--random-input-len` 设为目标命中长度，正式测量
 python bench.py hbm bench.json
 ```
 
-自动对每个 case 在所有 DP 分别预热公共前缀，再运行正式测量。正式请求共享公共前缀，剩余后缀各自生成。为了保持 vLLM 随机前缀的生成对应，预热使用与测量相同的请求数。
+先在每个目标 DP 上执行独立的 8K 预热组，再依次处理正式 case。每个 case 只向每个 DP 发送 **1 条**请求来预埋共享前缀，预埋并发为 1；正式测量仍使用 case 配置中的请求数与并发，所有请求共享公共前缀，剩余后缀各自生成。
+
+HBM 预埋通过兼容入口传入 `--num-prompts 1 --prefix-source-num-prompts N`，其中 N 为正式组请求数。入口使用正式组的 seed 和 N 生成数据，仅保留第 1 条交给 vLLM 发送，避免直接改变生成请求数导致共享前缀变化。额外参数由入口消费，不会传给原生 vLLM CLI。Cache、Posix 的各请求独立前缀仍需全量预埋。
 
 ## UCM Host Cache 命中
 
@@ -74,9 +76,9 @@ python bench.py cache bench.json --dp-rank 0
 
 也可在配置中写入 `"routing": {"mode": "fixed", "rank": 0}`。固定模式的预埋与测量都指向同一个 DP，汇总表保留其路由范围。
 
-## UCM 加载预热
+## 独立预热
 
-Cache 和 Posix 命中测试在全部正式 case 之前增加独立的加载预热。默认在每个目标 DP 上执行两组，每组 8K 输入、4 请求、4 并发、约 90% 前缀命中、输出 1 token。预热数据使用独立 seed，日志和 bench JSON 放在该轮的 `warmup_001/` 等目录中，正式汇总及 metrics 采集窗口从后续正式 case 开始。
+HBM、Cache 和 Posix 命中测试都在全部正式 case 之前增加独立预热。沿用配置字段 `ucm_warmup`，默认在每个目标 DP 上执行两组，每组 8K 输入、4 请求、4 并发、约 90% 前缀命中、输出 1 token。预热数据使用独立 seed，日志和 bench JSON 放在该轮的 `warmup_001/` 等目录中，正式汇总及 metrics 采集窗口从后续正式 case 开始。
 
 ```json
 "ucm_warmup": {
@@ -90,9 +92,9 @@ Cache 和 Posix 命中测试在全部正式 case 之前增加独立的加载预�
 }
 ```
 
-Cache 模式先预埋预热前缀、reset HBM，再向每个 DP 发送预热加载请求。Posix 的 `posix-seed` 同时预埋预热数据并保存其参数与 seed，重启后的 `posix-run` 先从 Posix 加载这些独立前缀，然后直接进入正式测试。每组预热使用不同 seed，使各组都能执行外部加载。自动 LB 模式覆盖所有 DP，固定 DP 模式覆盖指定 DP，预热阶段每次 bench 的并发为配置中的 `concurrency`。
+HBM 模式先向每个目标 DP 发送 1 条预热组的共享前缀，再发送完整的预热组请求命中 HBM，不调用 reset。Cache 模式先预埋预热前缀、reset HBM，再向每个 DP 发送预热加载请求。Posix 的 `posix-seed` 同时预埋预热数据并保存其参数与 seed，重启后的 `posix-run` 先从 Posix 加载这些独立前缀，然后直接进入正式测试。每组预热使用不同 seed。自动 LB 模式覆盖所有 DP，固定 DP 模式覆盖指定 DP，预热组命中阶段每次 bench 的并发为配置中的 `concurrency`。
 
-`enabled` 设为 `false` 可关闭加载预热。HBM 模式使用原有的公共前缀预热流程。Posix 重启后的预热参数和 seed 采用预埋记录中的值。历史预埋记录仍可继续测量，缺少预热数据时会提示本轮跳过加载预热，重新执行 `posix-seed` 可生成预热数据。
+`enabled` 设为 `false` 可关闭所有模式的独立预热组，正式 case 的前缀预埋仍会执行。Posix 重启后的预热参数和 seed 采用预埋记录中的值。历史预埋记录仍可继续测量，缺少预热数据时会提示本轮跳过加载预热，重新执行 `posix-seed` 可生成预热数据。
 
 ## 可选 metrics
 

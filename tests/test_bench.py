@@ -249,6 +249,10 @@ class WorkflowTest(unittest.TestCase):
                 self.assertGreater(
                     int(command[command.index("--random-prefix-len") + 1]), 0
                 )
+            else:
+                self.assertEqual(command[command.index("--num-prompts") + 1], "1")
+                self.assertEqual(command[command.index("--max-concurrency") + 1], "1")
+                self.assertIn("--prefix-source-num-prompts", command)
         self.assertFalse(any((self.root / "results").rglob("before.prom")))
 
     def test_posix_seeds_persist_and_metrics_option_can_change(self):
@@ -365,6 +369,65 @@ class WorkflowTest(unittest.TestCase):
         for command in loads:
             self.assertEqual(command[command.index("--random-input-len") + 1], "8192")
             self.assertEqual(command[command.index("--max-concurrency") + 1], "4")
+
+    def test_hbm_warmup_precedes_cases_and_seeds_once_per_dp(self):
+        self.enable_load_warmup()
+        self.run_mode("hbm")
+        manifest = self.manifests("hbm")[0]
+        self.assertEqual(len(manifest["warmups"]), 2)
+        all_cases = manifest["cases"] + manifest["warmups"]
+        self.assertEqual(len({case["seed"] for case in all_cases}), 4)
+        kinds = [kind for kind, _ in self.events]
+        self.assertEqual(kinds[:12], (["seed"] * 3 + ["warmup_load"] * 3) * 2)
+        self.assertNotIn("reset", kinds)
+        seeds = [command for kind, command in self.events if kind == "seed"]
+        self.assertEqual(len(seeds), 12)  # Two warmup groups and two cases, three DPs.
+        for command in seeds:
+            self.assertEqual(command[command.index("--num-prompts") + 1], "1")
+            self.assertEqual(command[command.index("--max-concurrency") + 1], "1")
+        for case in all_cases:
+            matching = [
+                command
+                for command in seeds
+                if command[command.index("--seed") + 1] == str(case["seed"])
+            ]
+            self.assertEqual(len(matching), 3)
+            for rank, command in enumerate(matching):
+                self.assertEqual(
+                    command[command.index("--prefix-source-num-prompts") + 1],
+                    str(case["num_requests"]),
+                )
+                self.assertEqual(
+                    command[command.index("--random-prefix-len") + 1],
+                    str(case["seed_tokens"]),
+                )
+                self.assertEqual(
+                    command[command.index("--header") + 1],
+                    f"X-data-parallel-rank={rank}",
+                )
+        measurements = [command for kind, command in self.events if kind == "measure"]
+        for case, command in zip(manifest["cases"], measurements):
+            self.assertEqual(
+                command[command.index("--num-prompts") + 1], str(case["num_requests"])
+            )
+            self.assertEqual(
+                command[command.index("--max-concurrency") + 1],
+                str(case["concurrency"]),
+            )
+            self.assertNotIn("--prefix-source-num-prompts", command)
+            self.assertNotIn("--header", command)
+        loads = [command for kind, command in self.events if kind == "warmup_load"]
+        self.assertEqual(len(loads), 6)
+        self.assertTrue(
+            all(
+                command[command.index("--random-prefix-len") + 1]
+                == str(manifest["warmups"][0]["seed_tokens"])
+                for command in loads
+            )
+        )
+        self.assertEqual(
+            len(list((self.root / "results").rglob("case_result.json"))), 2
+        )
 
     def test_posix_warmup_is_seeded_before_restart_and_replayed_after(self):
         self.enable_load_warmup()
@@ -576,6 +639,33 @@ class ExperimentLockTest(unittest.TestCase):
 
 
 class MetricsTest(unittest.TestCase):
+    def test_hbm_seed_samples_full_group_but_returns_only_first_request(self):
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(num_prompts=1)
+        calls = []
+
+        def get_samples(args, tokenizer):
+            calls.append((args.num_prompts, tokenizer))
+            return [
+                f"shared-prefix-generated-for-{args.num_prompts}-{i}"
+                for i in range(args.num_prompts)
+            ]
+
+        expected = get_samples(SimpleNamespace(num_prompts=40), "tokenizer")
+        module = SimpleNamespace(get_samples=get_samples)
+        bench_compat.install_prefix_seed_sampling(module, 40)
+        self.assertEqual(module.get_samples(args, "tokenizer"), expected[:1])
+        self.assertEqual(args.num_prompts, 1)
+        self.assertEqual(calls[-1], (40, "tokenizer"))
+        with mock.patch.object(
+            module, "get_samples", side_effect=ValueError("sample failed")
+        ):
+            bench_compat.install_prefix_seed_sampling(module, 40)
+            with self.assertRaisesRegex(ValueError, "sample failed"):
+                module.get_samples(args, "tokenizer")
+        self.assertEqual(args.num_prompts, 1)
+
     def test_performance_records_tpot_and_vllm_throughputs(self):
         from reporting import performance
 

@@ -173,7 +173,7 @@ def load_config(path: Path, args) -> dict:
         seed = positive_integer(config["seed"], "seed", 0)
         offsets = len(cases) + (
             warmup["rounds"]
-            if warmup["enabled"] and args.mode in ("cache", "posix-seed")
+            if warmup["enabled"] and args.mode in ("hbm", "cache", "posix-seed")
             else 0
         )
         if seed + offsets - 1 >= 2**32:
@@ -377,6 +377,7 @@ class BenchCLI:
         output_len: int,
         concurrency: int,
         rank: int | None,
+        prefix_source_count: int | None = None,
     ) -> dict:
         result_path = directory / f"{label}.json"
         command = [
@@ -418,6 +419,14 @@ class BenchCLI:
         ]
         if rank is not None:
             command += ["--header", f"X-data-parallel-rank={rank}"]
+        if prefix_source_count is not None:
+            command = [
+                sys.executable,
+                str(ROOT / "bench_compat.py"),
+                "--prefix-source-num-prompts",
+                str(prefix_source_count),
+                *command[len(self.command) :],
+            ]
         print(shlex.join(command), flush=True)
         if self.dry_run:
             return {}
@@ -500,7 +509,7 @@ class Experiment:
                     )
         else:
             self.cases = [dict(case) for case in config["cases"]]
-            if self.mode != "hbm" and config["ucm_warmup"]["enabled"]:
+            if config["ucm_warmup"]["enabled"]:
                 for index in range(config["ucm_warmup"]["rounds"]):
                     warmup = dict(config["ucm_warmup"])
                     warmup["name"] = f"warmup_{index + 1:03d}"
@@ -552,12 +561,25 @@ class Experiment:
         count = len(self.ranks())
         concurrency = max(1, math.ceil(case["concurrency"] / count))
         for rank in self.ranks():
+            seed_case = case
+            prefix_source_count = None
             if self.mode == "hbm":
                 inputs, prefix = 1, case["seed_tokens"]
+                seed_case = {**case, "num_requests": 1}
+                concurrency = 1
+                prefix_source_count = case["num_requests"]
             else:
                 inputs, prefix = case["seed_tokens"], 0
             result = self.cli.run(
-                case, directory, f"seed_dp{rank}", inputs, prefix, 1, concurrency, rank
+                seed_case,
+                directory,
+                f"seed_dp{rank}",
+                inputs,
+                prefix,
+                1,
+                concurrency,
+                rank,
+                prefix_source_count=prefix_source_count,
             )
             if result.get("validation_errors"):
                 raise RuntimeError(
@@ -575,7 +597,8 @@ class Experiment:
         for warmup in self.warmups:
             directory = self.directory / warmup["name"]
             print(
-                f"\nUCM load warmup {warmup['name']} seed={warmup['seed']}", flush=True
+                f"\n{'HBM' if self.mode == 'hbm' else 'UCM load'} warmup {warmup['name']} seed={warmup['seed']}",
+                flush=True,
             )
             if self.mode != "posix-run":
                 self.seed_case(warmup, directory)
@@ -583,19 +606,20 @@ class Experiment:
                 if self.mode == "cache":
                     reset_prefix(self.config, self.args.dry_run)
                 for rank in self.ranks():
+                    prefix = warmup["seed_tokens"] if self.mode == "hbm" else 0
                     result = self.cli.run(
                         warmup,
                         directory,
                         f"warmup_load_dp{rank}",
-                        warmup["input_len"],
-                        0,
+                        warmup["input_len"] - prefix,
+                        prefix,
                         warmup["output_len"],
                         warmup["concurrency"],
                         rank,
                     )
                     if result.get("validation_errors"):
                         raise RuntimeError(
-                            f"UCM load warmup failed on DP{rank}: {result['validation_errors']}"
+                            f"Warmup failed on DP{rank}: {result['validation_errors']}"
                         )
                 if not self.args.dry_run:
                     time.sleep(
