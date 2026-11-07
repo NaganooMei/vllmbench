@@ -128,7 +128,7 @@ def load_config(path: Path, args) -> dict:
     normalize_case(warmup, "ucm_warmup", config["block_tokens"])
     if (
         warmup["enabled"]
-        and args.mode in ("cache", "posix-seed")
+        and args.mode in ("cache", "posix-seed", "posix-reset")
         and warmup["seed_tokens"] == 0
     ):
         raise ValueError(
@@ -173,7 +173,8 @@ def load_config(path: Path, args) -> dict:
         seed = positive_integer(config["seed"], "seed", 0)
         offsets = len(cases) + (
             warmup["rounds"]
-            if warmup["enabled"] and args.mode in ("hbm", "cache", "posix-seed")
+            if warmup["enabled"]
+            and args.mode in ("hbm", "cache", "posix-seed", "posix-reset")
             else 0
         )
         if seed + offsets - 1 >= 2**32:
@@ -293,8 +294,12 @@ def http_request(url: str, method: str = "GET", timeout: float = 10) -> bytes:
         return response.read()
 
 
-def reset_prefix(config: dict, dry_run: bool) -> None:
-    url = config["base_url"] + "/reset_prefix_cache?reset_external=false"
+def reset_prefix(config: dict, dry_run: bool, reset_external: bool = False) -> None:
+    url = (
+        config["base_url"]
+        + "/reset_prefix_cache?reset_external="
+        + str(reset_external).lower()
+    )
     print(f"POST {url}", flush=True)
     if dry_run:
         return
@@ -307,7 +312,7 @@ def reset_prefix(config: dict, dry_run: bool) -> None:
             return
         if time.monotonic() >= deadline:
             raise RuntimeError(
-                "HBM prefix reset did not succeed before reset_timeout_seconds"
+                "Cache reset did not succeed before reset_timeout_seconds"
             )
         time.sleep(1)
 
@@ -603,8 +608,12 @@ class Experiment:
             if self.mode != "posix-run":
                 self.seed_case(warmup, directory)
             if self.mode != "posix-seed":
-                if self.mode == "cache":
-                    reset_prefix(self.config, self.args.dry_run)
+                if self.mode in ("cache", "posix-reset"):
+                    reset_prefix(
+                        self.config,
+                        self.args.dry_run,
+                        reset_external=self.mode == "posix-reset",
+                    )
                 for rank in self.ranks():
                     prefix = warmup["seed_tokens"] if self.mode == "hbm" else 0
                     result = self.cli.run(
@@ -739,8 +748,12 @@ class Experiment:
                 if self.mode != "posix-run":
                     self.seed_case(case, directory)
                 if self.mode != "posix-seed":
-                    if self.mode == "cache":
-                        reset_prefix(self.config, self.args.dry_run)
+                    if self.mode in ("cache", "posix-reset"):
+                        reset_prefix(
+                            self.config,
+                            self.args.dry_run,
+                            reset_external=self.mode == "posix-reset",
+                        )
                     self.measure_case(case, directory)
                 self.manifest["case_status"][case["name"]] = "complete"
                 self.save()
@@ -766,7 +779,8 @@ class Experiment:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "mode", choices=("hbm", "cache", "posix-seed", "posix-run", "report")
+        "mode",
+        choices=("hbm", "cache", "posix-seed", "posix-run", "posix-reset", "report"),
     )
     parser.add_argument(
         "config",

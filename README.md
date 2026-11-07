@@ -66,6 +66,26 @@ python bench.py posix-run bench.json
 
 第二条命令自动读取匹配配置的最新成功预埋记录及其 seed。也可以用 `--run results/<seed-run>` 指定历史预埋记录。每次重测 Posix 都需要重新建立冷 HBM/Host Cache 状态。`seed_settle_seconds` 是预埋后的等待时间，写出完成仍需结合 UCM 现场状态确认。
 
+## UCM Posix 清缓存对照组（不重启）
+
+在已包含 UCM 清 Cache 功能的服务上执行：
+
+```bash
+python bench.py posix-reset bench.json
+```
+
+一条命令自动执行独立加载预热，再对每个 case 在每个目标 DP 预埋全部请求的目标前缀（例如 90% 输入），等待 `seed_settle_seconds`，调用下面的接口，成功后用相同 seed 和相同请求数发送全长正式请求：
+
+```bash
+curl -X POST 'http://localhost:18081/reset_prefix_cache?reset_external=true'
+```
+
+该接口需要清空 HBM 和 UCM 内存 Cache，保留后端 Posix 文件。reset 返回失败会重试至 `reset_timeout_seconds`，失败或超时则停止该轮，不执行正式测量。预埋等待时间应足够让 Posix 异步写入完成；该组不停止或重启服务，也不需要先跑 `posix-seed`。
+
+预热组同样先预埋，再清 HBM 和 UCM Cache，然后执行加载预热。每个正式 case 的计数窗口从 reset 成功之后开始，预热和清理不计入正式性能结果。汇总表的 Mode 为 `posix-reset`，与停服重启的 `posix` 组区分；支持默认全 DP 预埋加自动 LB、`--dp-rank` 和 `--collect-metrics`。
+
+HBM hit、External hit、Host Ready 和 Posix bytes 可用于核对加载来源；接口成功不等同于已验证 Posix 命中。此流程清的是 UCM 内存缓存，不清操作系统文件页缓存，因此不能视为与服务重启完全相同的底层 I/O 冷态。
+
 ## 自动 LB 和固定 DP
 
 默认模式下，预埋覆盖每个 DP，正式请求交给内部 LB 分配。固定 DP 可通过命令行选择。

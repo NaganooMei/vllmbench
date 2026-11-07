@@ -36,6 +36,9 @@ class WorkflowTest(unittest.TestCase):
         self.queries = 0
         self.external = 0
         self.shards = 0
+        self.posix_shards = 0
+        self.posix_bytes = 0
+        self.external_reset = False
         self.load_observations = 0
         self.fail_measurement = False
         self.metrics_unavailable = False
@@ -62,6 +65,8 @@ class WorkflowTest(unittest.TestCase):
             def do_POST(self):
                 owner.events.append(("reset", self.path))
                 success = owner.reset_failures == 0
+                if success:
+                    owner.external_reset = "reset_external=true" in self.path
                 owner.reset_failures = max(0, owner.reset_failures - 1)
                 self.send_response(200)
                 self.end_headers()
@@ -120,9 +125,9 @@ class WorkflowTest(unittest.TestCase):
             f"vllm:external_prefix_cache_queries_total{labels} {self.queries}",
             f"vllm:external_prefix_cache_hits_total{labels} {self.external}",
             f"ucm:cache_load_success_shards_total{labels} {self.shards}",
-            f"ucm:cache_posix_load_success_shards_total{labels} 0",
-            f"ucm:cache_load_backend_shards_total{labels} 0",
-            f"ucm:posix_s2h_bytes_total{labels} 0",
+            f"ucm:cache_posix_load_success_shards_total{labels} {self.posix_shards}",
+            f"ucm:cache_load_backend_shards_total{labels} {self.posix_shards}",
+            f"ucm:posix_s2h_bytes_total{labels} {self.posix_bytes}",
         ]
         for rank in (0, 1):
             rank_labels = f'model_name="test",engine="0",worker_rank="{rank}"'
@@ -150,6 +155,9 @@ class WorkflowTest(unittest.TestCase):
         if measured or warmup_load:
             self.external += count * int(length * 0.9)
             self.shards += count
+            if self.external_reset:
+                self.posix_shards += count
+                self.posix_bytes += count * 4096
             self.load_observations += 1
         result = {
             "completed": count - int(measured and self.fail_measurement),
@@ -269,6 +277,85 @@ class WorkflowTest(unittest.TestCase):
         self.config["cases"][0]["num_requests"] += 1
         self.save_config()
         self.run_mode("posix-run", expected=1)
+
+    def test_posix_reset_seeds_all_dp_clears_both_tiers_then_measures(self):
+        self.run_mode("posix-reset", "--collect-metrics")
+        self.assertEqual(
+            [kind for kind, _ in self.events],
+            ["seed", "seed", "seed", "reset", "snapshot", "measure", "snapshot"] * 2,
+        )
+        self.assertEqual(
+            [value for kind, value in self.events if kind == "reset"],
+            ["/reset_prefix_cache?reset_external=true"] * 2,
+        )
+        manifest = self.manifests("posix-reset")[0]
+        self.assertEqual(manifest["status"], "complete")
+        self.assertIsNone(manifest["seed_source"])
+        seeds = [command for kind, command in self.events if kind == "seed"]
+        measures = [command for kind, command in self.events if kind == "measure"]
+        for index, case in enumerate(manifest["cases"]):
+            measurement = measures[index]
+            self.assertNotIn("--header", measurement)
+            self.assertEqual(
+                measurement[measurement.index("--random-input-len") + 1],
+                str(case["input_len"]),
+            )
+            for rank in range(3):
+                seed = seeds[index * 3 + rank]
+                self.assertEqual(
+                    seed[seed.index("--header") + 1], f"X-data-parallel-rank={rank}"
+                )
+                self.assertEqual(
+                    seed[seed.index("--random-input-len") + 1], str(case["seed_tokens"])
+                )
+                for flag in ("--seed", "--num-prompts"):
+                    self.assertEqual(
+                        seed[seed.index(flag) + 1],
+                        measurement[measurement.index(flag) + 1],
+                    )
+        rows = [
+            json.loads(path.read_text())
+            for path in (self.root / "results").rglob("case_result.json")
+        ]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["mode"], "posix-reset")
+            self.assertEqual(row["hbm_hit_rate"], 0)
+            self.assertEqual(row["external_hit_rate"], 0.9)
+            self.assertEqual(row["host_ready_shard_fraction"], 0)
+            self.assertEqual(row["posix_read_bytes"], row["num_requests"] * 4096)
+
+    def test_posix_reset_warmup_fixed_dp_excluded_from_formal_counts(self):
+        self.enable_load_warmup()
+        self.run_mode("posix-reset", "--dp-rank", "1")
+        self.assertEqual(
+            [kind for kind, _ in self.events],
+            ["seed", "reset", "warmup_load"] * 2
+            + ["seed", "reset", "snapshot", "measure", "snapshot"] * 2,
+        )
+        for kind, command in self.events:
+            if kind in ("seed", "warmup_load", "measure"):
+                self.assertEqual(
+                    command[command.index("--header") + 1], "X-data-parallel-rank=1"
+                )
+            elif kind == "reset":
+                self.assertEqual(command, "/reset_prefix_cache?reset_external=true")
+        rows = [
+            json.loads(path.read_text())
+            for path in (self.root / "results").rglob("case_result.json")
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(
+            all(row["posix_read_bytes"] == row["num_requests"] * 4096 for row in rows)
+        )
+
+    def test_posix_reset_failure_stops_before_measurement(self):
+        self.config["reset_timeout_seconds"] = 0
+        self.save_config()
+        self.reset_failures = 1
+        self.run_mode("posix-reset", expected=1)
+        self.assertEqual([kind for kind, _ in self.events], ["seed"] * 3 + ["reset"])
+        self.assertEqual(self.manifests("posix-reset")[0]["status"], "failed")
 
     def test_posix_commands_preserve_original_a3_short_seed_full_measurement(self):
         self.config["dp"] = 2
