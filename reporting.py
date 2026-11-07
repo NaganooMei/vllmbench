@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import math
@@ -140,6 +141,18 @@ def column_name(index: int) -> str:
         index, remainder = divmod(index - 1, 26)
         name = chr(65 + remainder) + name
     return name
+
+
+def compact_run_time(run_id: str) -> str:
+    try:
+        started = datetime.strptime(run_id.split("_", 1)[0], "%Y%m%dT%H%M%SZ")
+    except ValueError:
+        return "n/a"
+    return (
+        started.replace(tzinfo=timezone.utc)
+        .astimezone(timezone(timedelta(hours=8)))
+        .strftime("%m-%d %H:%M")
+    )
 
 
 def worksheet(headers: tuple, rows: list, rate_columns: set[int]) -> str:
@@ -301,6 +314,7 @@ def write_summary(directory: Path) -> list[dict]:
         writer.writerows(rows)
     write_workbook(directory / "summary.xlsx", FIELDS, rows)
     headers = (
+        "Date (CST)",
         "Mode",
         "Case",
         "Model",
@@ -335,6 +349,7 @@ def write_summary(directory: Path) -> list[dict]:
         posix_bytes = result.get("posix_read_bytes")
         table.append(
             (
+                compact_run_time(result.get("run_id") or ""),
                 result["mode"],
                 result["case"],
                 result.get("served_model") or "n/a",
