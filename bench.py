@@ -306,9 +306,30 @@ def reset_prefix(config: dict, dry_run: bool, reset_external: bool = False) -> N
     deadline = time.monotonic() + config["reset_timeout_seconds"]
     while True:
         body = http_request(url, "POST")
-        # Older vLLM releases return an empty HTTP 200 response.
-        result = json.loads(body) if body.strip() else {"success": True}
-        if result is True or isinstance(result, dict) and result.get("success") is True:
+        if not body.strip():
+            raise RuntimeError(
+                "Reset endpoint returned an empty response: HTTP 200 does not confirm "
+                'cache reset. Update the server to return {"success": true/false}; '
+                "measurement will not run."
+            )
+        try:
+            result = json.loads(body)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RuntimeError(
+                "Reset endpoint returned invalid JSON; cache reset is unverified. "
+                "Measurement will not run."
+            ) from error
+        success = result.get("success") if isinstance(result, dict) else result
+        if not isinstance(success, bool):
+            raise RuntimeError(
+                'Reset endpoint must return {"success": true/false} or a JSON boolean; '
+                "cache reset is unverified. Measurement will not run."
+            )
+        print(
+            f"Reset response: success={str(success).lower()} (reset_external={str(reset_external).lower()})",
+            flush=True,
+        )
+        if success:
             return
         if time.monotonic() >= deadline:
             raise RuntimeError(

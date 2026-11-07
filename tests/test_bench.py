@@ -43,6 +43,7 @@ class WorkflowTest(unittest.TestCase):
         self.fail_measurement = False
         self.metrics_unavailable = False
         self.reset_failures = 0
+        self.reset_response = None
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -70,7 +71,11 @@ class WorkflowTest(unittest.TestCase):
                 owner.reset_failures = max(0, owner.reset_failures - 1)
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": success}).encode())
+                self.wfile.write(
+                    owner.reset_response
+                    if owner.reset_response is not None
+                    else json.dumps({"success": success}).encode()
+                )
 
             def log_message(self, *args):
                 pass
@@ -356,6 +361,44 @@ class WorkflowTest(unittest.TestCase):
         self.run_mode("posix-reset", expected=1)
         self.assertEqual([kind for kind, _ in self.events], ["seed"] * 3 + ["reset"])
         self.assertEqual(self.manifests("posix-reset")[0]["status"], "failed")
+
+    def test_empty_reset_200_stops_cache_and_posix_reset_before_measurement(self):
+        self.reset_response = b""
+        for mode in ("cache", "posix-reset"):
+            with self.subTest(mode=mode):
+                self.events.clear()
+                self.run_mode(mode, expected=1)
+                self.assertEqual(
+                    [kind for kind, _ in self.events], ["seed"] * 3 + ["reset"]
+                )
+                manifest = self.manifests(mode)[0]
+                self.assertEqual(manifest["status"], "failed")
+                self.assertIn("empty response", manifest["error"])
+
+    def test_reset_requires_explicit_boolean_and_prints_success(self):
+        args = bench.parse_args(["posix-reset", str(self.config_path)])
+        config = bench.load_config(self.config_path, args)
+        for response in (
+            b"{}",
+            b'{"success":"true"}',
+            b'{"success":1}',
+            b"1",
+            b"null",
+            b"[]",
+            b"not json",
+            b" \n",
+        ):
+            with self.subTest(response=response):
+                self.reset_response = response
+                with self.assertRaises(RuntimeError), redirect_stdout(io.StringIO()):
+                    bench.reset_prefix(config, False, reset_external=True)
+        for response in (b'{"success":true}', b"true"):
+            with self.subTest(response=response):
+                self.reset_response = response
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    bench.reset_prefix(config, False, reset_external=True)
+                self.assertIn("success=true (reset_external=true)", output.getvalue())
 
     def test_posix_commands_preserve_original_a3_short_seed_full_measurement(self):
         self.config["dp"] = 2

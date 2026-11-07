@@ -82,6 +82,8 @@ curl -X POST 'http://localhost:18081/reset_prefix_cache?reset_external=true'
 
 该接口需要清空 HBM 和 UCM 内存 Cache，保留后端 Posix 文件。reset 返回失败会重试至 `reset_timeout_seconds`，失败或超时则停止该轮，不执行正式测量。预埋等待时间应足够让 Posix 异步写入完成；该组不停止或重启服务，也不需要先跑 `posix-seed`。
 
+Cache 和 `posix-reset` 模式都严格检查响应体：只有 `{"success": true}` 或 JSON 布尔值 `true` 才继续；明确返回 `false` 时重试。空 HTTP 200、无效 JSON、缺少布尔型 `success` 等情况立即报错，不能验证清理结果时不进入正式测试。旧服务需要修改 reset 接口以返回引擎清理结果。终端会打印 `Reset response: success=true/false (reset_external=...)`，方便核对；客户端仍受服务端 DP 返回值聚合范围限制。
+
 预热组同样先预埋，再清 HBM 和 UCM Cache，然后执行加载预热。每个正式 case 的计数窗口从 reset 成功之后开始，预热和清理不计入正式性能结果。汇总表的 Mode 为 `posix-reset`，与停服重启的 `posix` 组区分；支持默认全 DP 预埋加自动 LB、`--dp-rank` 和 `--collect-metrics`。
 
 HBM hit、External hit、Host Ready 和 Posix bytes 可用于核对加载来源；接口成功不等同于已验证 Posix 命中。此流程清的是 UCM 内存缓存，不清操作系统文件页缓存，因此不能视为与服务重启完全相同的底层 I/O 冷态。
