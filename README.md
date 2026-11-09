@@ -6,6 +6,8 @@
 
 修改仓库中的 `bench.json`，填写服务地址、模型、DP 数以及全部 case。每个 case 提供 `input_len`、`output_len`、`hit_rate`、`concurrency`、`num_requests`，长度单位均为 token，命中率范围为 0～1。`concurrency` 和 `num_requests` 均按整个客户端测量批次计算。
 
+示例模型路径默认为 `/models/xxx`，运行时替换为实际模型目录。
+
 每轮自动生成随机 seed，每个 case 使用独立 seed。预埋和测量使用相同 seed 和请求数，随机长度波动固定为 0。可在配置中设置整数 `seed` 复现指定实验，默认采用随机生成。
 
 UCM 预埋直接把 `--random-input-len` 设为目标命中长度，正式测量设为完整输入长度，两阶段均使用 `--dataset-name random --random-prefix-len 0`。例如 32K、90% 的预埋长度是 29491，正式长度是 32768。
@@ -100,12 +102,12 @@ python bench.py cache bench.json --dp-rank 0
 
 ## 独立预热
 
-HBM、Cache 和 Posix 命中测试都在全部正式 case 之前增加独立预热。沿用配置字段 `ucm_warmup`，默认在每个目标 DP 上执行两组，每组 8K 输入、4 请求、4 并发、约 90% 前缀命中、输出 1 token。预热数据使用独立 seed，日志和 bench JSON 放在该轮的 `warmup_001/` 等目录中，正式汇总及 metrics 采集窗口从后续正式 case 开始。
+HBM、Cache 和 Posix 命中测试都在全部正式 case 之前增加独立预热。沿用配置字段 `ucm_warmup`，默认在每个目标 DP 上执行 1 组，只预埋该组预热数据；每组 8K 输入、4 请求、4 并发、约 90% 前缀命中、输出 1 token。预热数据使用独立 seed，日志和 bench JSON 放在该轮的 `warmup_001/` 等目录中，正式汇总及 metrics 采集窗口从后续正式 case 开始。
 
 ```json
 "ucm_warmup": {
   "enabled": true,
-  "rounds": 2,
+  "rounds": 1,
   "input_len": 8192,
   "output_len": 1,
   "hit_rate": 0.9,

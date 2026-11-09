@@ -1,11 +1,11 @@
 {
   "base_url": "http://localhost:18081",
-  "model": "/data/models/GLM-5.3-Flash-w8a8",
+  "model": "/models/xxx",
   "served_model": "glm",
   "dp": 2,
   "routing": {"mode": "auto"},
   "ucm_warmup": {
-    "enabled": true, "rounds": 2,
+    "enabled": true, "rounds": 1,
     "input_len": 8192, "output_len": 1,
     "hit_rate": 0.9, "concurrency": 4, "num_requests": 4
   },

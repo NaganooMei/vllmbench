@@ -115,7 +115,7 @@ def load_config(path: Path, args) -> dict:
     if not isinstance(warmup["enabled"], bool):
         raise ValueError("ucm_warmup.enabled must be true or false")
     defaults = {
-        "rounds": 2,
+        "rounds": 1,
         "input_len": 8192,
         "output_len": 1,
         "hit_rate": 0.9,
