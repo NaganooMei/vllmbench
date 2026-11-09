@@ -575,8 +575,6 @@ class Experiment:
     def seed_case(self, case: dict, directory: Path) -> None:
         if case["seed_tokens"] == 0:
             return
-        count = len(self.ranks())
-        concurrency = max(1, math.ceil(case["concurrency"] / count))
         for rank in self.ranks():
             result = self.cli.run(
                 case,
@@ -585,7 +583,7 @@ class Experiment:
                 case["seed_tokens"],
                 0,
                 1,
-                concurrency,
+                case["concurrency"],
                 rank,
             )
             if result.get("validation_errors"):

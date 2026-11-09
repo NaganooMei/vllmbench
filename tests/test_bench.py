@@ -433,7 +433,7 @@ class WorkflowTest(unittest.TestCase):
                     ("--random-prefix-len", 0),
                     ("--random-output-len", 1),
                     ("--num-prompts", count),
-                    ("--max-concurrency", count // 2),
+                    ("--max-concurrency", count),
                     ("--seed", seed),
                     ("--header", f"X-data-parallel-rank={rank}"),
                 ]:
@@ -530,7 +530,7 @@ class WorkflowTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     command[command.index("--max-concurrency") + 1],
-                    str((case["concurrency"] + 2) // 3),
+                    str(case["concurrency"]),
                 )
                 self.assertEqual(command[command.index("--random-output-len") + 1], "1")
                 self.assertNotIn("--prefix-source-num-prompts", command)
