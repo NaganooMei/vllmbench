@@ -1,4 +1,4 @@
-"""Run vLLM's CLI with probe compatibility and optional single-request prefix seeding."""
+"""Run vLLM's bench CLI while disabling its initial inference ready probe."""
 
 from __future__ import annotations
 
@@ -22,32 +22,10 @@ def install_probe_override(module) -> None:
     module.wait_for_endpoint = endpoint_already_checked
 
 
-def install_prefix_seed_sampling(module, source_count: int) -> None:
-    # RandomDataset samples per-request offsets before the common prefix.
-    # Preserve that RNG consumption, then send just one generated request.
-    original = module.get_samples
-
-    def first_request(args, *positional, **kwargs):
-        count = args.num_prompts
-        args.num_prompts = source_count
-        try:
-            requests = original(args, *positional, **kwargs)
-        finally:
-            args.num_prompts = count
-        return requests[:1]
-
-    module.get_samples = first_request
-
-
 def main() -> None:
     os.environ["VLLM_USE_RUST_BENCH"] = "0"
     import vllm.benchmarks.serve as serve
 
-    if "--prefix-source-num-prompts" in sys.argv:
-        index = sys.argv.index("--prefix-source-num-prompts")
-        source_count = int(sys.argv[index + 1])
-        del sys.argv[index : index + 2]
-        install_prefix_seed_sampling(serve, source_count)
     if "--ready-check-timeout-sec" not in sys.argv:
         install_probe_override(serve)
     from vllm.entrypoints.cli.main import main as vllm_main

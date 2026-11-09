@@ -403,7 +403,6 @@ class BenchCLI:
         output_len: int,
         concurrency: int,
         rank: int | None,
-        prefix_source_count: int | None = None,
     ) -> dict:
         result_path = directory / f"{label}.json"
         command = [
@@ -445,14 +444,6 @@ class BenchCLI:
         ]
         if rank is not None:
             command += ["--header", f"X-data-parallel-rank={rank}"]
-        if prefix_source_count is not None:
-            command = [
-                sys.executable,
-                str(ROOT / "bench_compat.py"),
-                "--prefix-source-num-prompts",
-                str(prefix_source_count),
-                *command[len(self.command) :],
-            ]
         print(shlex.join(command), flush=True)
         if self.dry_run:
             return {}
@@ -587,25 +578,15 @@ class Experiment:
         count = len(self.ranks())
         concurrency = max(1, math.ceil(case["concurrency"] / count))
         for rank in self.ranks():
-            seed_case = case
-            prefix_source_count = None
-            if self.mode == "hbm":
-                inputs, prefix = 1, case["seed_tokens"]
-                seed_case = {**case, "num_requests": 1}
-                concurrency = 1
-                prefix_source_count = case["num_requests"]
-            else:
-                inputs, prefix = case["seed_tokens"], 0
             result = self.cli.run(
-                seed_case,
+                case,
                 directory,
                 f"seed_dp{rank}",
-                inputs,
-                prefix,
+                case["seed_tokens"],
+                0,
                 1,
                 concurrency,
                 rank,
-                prefix_source_count=prefix_source_count,
             )
             if result.get("validation_errors"):
                 raise RuntimeError(
@@ -636,13 +617,12 @@ class Experiment:
                         reset_external=self.mode == "posix-reset",
                     )
                 for rank in self.ranks():
-                    prefix = warmup["seed_tokens"] if self.mode == "hbm" else 0
                     result = self.cli.run(
                         warmup,
                         directory,
                         f"warmup_load_dp{rank}",
-                        warmup["input_len"] - prefix,
-                        prefix,
+                        warmup["input_len"],
+                        0,
                         warmup["output_len"],
                         warmup["concurrency"],
                         rank,
@@ -689,11 +669,7 @@ class Experiment:
             "metrics_status": "not started",
             "measurement_dir": str(directory),
         }
-        if self.mode == "hbm" and case["seed_tokens"]:
-            inputs = case["input_len"] - case["seed_tokens"]
-            prefix = case["seed_tokens"]
-        else:
-            inputs, prefix = case["input_len"], 0
+        inputs, prefix = case["input_len"], 0
         capture = None
         result = {}
         try:

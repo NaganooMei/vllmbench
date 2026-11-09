@@ -38,9 +38,9 @@ UCM 预埋直接把 `--random-input-len` 设为目标命中长度，正式测量
 python bench.py hbm bench.json
 ```
 
-先在每个目标 DP 上执行独立的 8K 预热组，再依次处理正式 case。每个 case 只向每个 DP 发送 **1 条**请求来预埋共享前缀，预埋并发为 1；正式测量仍使用 case 配置中的请求数与并发，所有请求共享公共前缀，剩余后缀各自生成。
+先在每个目标 DP 上执行独立的 8K 预热组，再依次处理正式 case。HBM、Cache、Posix 均使用每条请求各自的随机前缀，不设置公共前缀（`--random-prefix-len 0`）。HBM 的流程与 Cache 相同，只是不调用 reset：每个目标 DP 都预埋该 case 的完整请求集合，输入长度为目标命中部分（例如 90%），输出 1 token；随后保留 HBM 缓存，使用相同 seed、相同请求数发送全长正式请求。
 
-HBM 预埋通过兼容入口传入 `--num-prompts 1 --prefix-source-num-prompts N`，其中 N 为正式组请求数。入口使用正式组的 seed 和 N 生成数据，仅保留第 1 条交给 vLLM 发送，避免直接改变生成请求数导致共享前缀变化。额外参数由入口消费，不会传给原生 vLLM CLI。Cache、Posix 的各请求独立前缀仍需全量预埋。
+预埋在各 DP 上分别执行，并发为 `ceil(case.concurrency / 目标 DP 数)`；正式组仍使用 case 配置中的并发和请求数，默认走内部 LB。各 DP 的 HBM 需要容纳完整预埋集合，否则实际命中率可能低于目标值。原先每 DP 仅发 1 条共享前缀的方案已移除。历史 HBM 结果不会被转换为新方案，比较时应使用重新运行的结果。
 
 ## UCM Host Cache 命中
 
@@ -114,7 +114,7 @@ HBM、Cache 和 Posix 命中测试都在全部正式 case 之前增加独立预�
 }
 ```
 
-HBM 模式先向每个目标 DP 发送 1 条预热组的共享前缀，再发送完整的预热组请求命中 HBM，不调用 reset。Cache 模式先预埋预热前缀、reset HBM，再向每个 DP 发送预热加载请求。Posix 的 `posix-seed` 同时预埋预热数据并保存其参数与 seed，重启后的 `posix-run` 先从 Posix 加载这些独立前缀，然后直接进入正式测试。每组预热使用不同 seed。自动 LB 模式覆盖所有 DP，固定 DP 模式覆盖指定 DP，预热组命中阶段每次 bench 的并发为配置中的 `concurrency`。
+HBM 模式先向每个目标 DP 预埋预热组全部请求的独立前缀，再发送全长的预热组请求命中 HBM，不调用 reset。Cache 模式先预埋预热前缀、reset HBM，再向每个 DP 发送预热加载请求。Posix 的 `posix-seed` 同时预埋预热数据并保存其参数与 seed，重启后的 `posix-run` 先从 Posix 加载这些独立前缀，然后直接进入正式测试。每组预热使用不同 seed。自动 LB 模式覆盖所有 DP，固定 DP 模式覆盖指定 DP，预热组命中阶段每次 bench 的并发为配置中的 `concurrency`。
 
 `enabled` 设为 `false` 可关闭所有模式的独立预热组，正式 case 的前缀预埋仍会执行。Posix 重启后的预热参数和 seed 采用预埋记录中的值。历史预埋记录仍可继续测量，缺少预热数据时会提示本轮跳过加载预热，重新执行 `posix-seed` 可生成预热数据。
 
