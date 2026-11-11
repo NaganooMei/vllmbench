@@ -26,6 +26,8 @@ from metrics_capture import MetricsCapture
 from reporting import performance, write_summary
 
 ROOT = Path(__file__).resolve().parent
+V4_HBM_ALIGNMENT = 4096
+V4_HBM_TAIL_TOKENS = 32
 
 
 def save_json(path: Path, value) -> None:
@@ -42,7 +44,7 @@ def positive_integer(value, name: str, minimum: int = 1) -> int:
     return value
 
 
-def normalize_case(case: dict, label: str, block: int) -> None:
+def normalize_case(case: dict, label: str, block: int, mode: str = "") -> None:
     if not isinstance(case, dict):
         raise ValueError(f"{label} must be a JSON object")
     for field in ("input_len", "output_len", "concurrency", "num_requests"):
@@ -55,9 +57,20 @@ def normalize_case(case: dict, label: str, block: int) -> None:
         raise ValueError(f"{label} hit_rate must be between 0 and 1")
     if case["concurrency"] > case["num_requests"]:
         raise ValueError(f"{label} concurrency exceeds num_requests")
-    # Leave a token for vLLM's normal final-token recomputation at 100%.
-    available = min(int(case["input_len"] * hit_rate), case["input_len"] - 1)
-    case["seed_tokens"] = available // block * block
+    if mode == "v4hbm":
+        # MTP's 32-token tail is matched and dropped before the HBM hit.
+        # Keep the entire seeded prefix within the measured input at 100%.
+        available = min(
+            int(case["input_len"] * hit_rate),
+            max(0, case["input_len"] - V4_HBM_TAIL_TOKENS),
+        )
+        target = available // V4_HBM_ALIGNMENT * V4_HBM_ALIGNMENT
+        case["expected_hbm_tokens"] = target
+        case["seed_tokens"] = target + V4_HBM_TAIL_TOKENS if target else 0
+    else:
+        # Leave a token for vLLM's normal final-token recomputation at 100%.
+        available = min(int(case["input_len"] * hit_rate), case["input_len"] - 1)
+        case["seed_tokens"] = available // block * block
     case["hit_rate"] = float(hit_rate)
 
 
@@ -104,7 +117,7 @@ def load_config(path: Path, args) -> dict:
     if not isinstance(cases, list) or not cases:
         raise ValueError("cases must be a non-empty list")
     for index, case in enumerate(cases, start=1):
-        normalize_case(case, f"case {index}", config["block_tokens"])
+        normalize_case(case, f"case {index}", config["block_tokens"], args.mode)
         case["name"] = (
             f"{index:03d}_{case['input_len']}in_{case['output_len']}out_c{case['concurrency']}_n{case['num_requests']}"
         )
@@ -125,7 +138,7 @@ def load_config(path: Path, args) -> dict:
     for field, default in defaults.items():
         warmup.setdefault(field, default)
     positive_integer(warmup["rounds"], "ucm_warmup.rounds")
-    normalize_case(warmup, "ucm_warmup", config["block_tokens"])
+    normalize_case(warmup, "ucm_warmup", config["block_tokens"], args.mode)
     if (
         warmup["enabled"]
         and args.mode in ("cache", "posix-seed", "posix-reset")
@@ -174,7 +187,8 @@ def load_config(path: Path, args) -> dict:
         offsets = len(cases) + (
             warmup["rounds"]
             if warmup["enabled"]
-            and args.mode in ("hbm", "hbm-shared", "cache", "posix-seed", "posix-reset")
+            and args.mode
+            in ("hbm", "hbm-shared", "v4hbm", "cache", "posix-seed", "posix-reset")
             else 0
         )
         if seed + offsets - 1 >= 2**32:
@@ -613,7 +627,7 @@ class Experiment:
         for warmup in self.warmups:
             directory = self.directory / warmup["name"]
             print(
-                f"\n{'HBM' if self.mode in ('hbm', 'hbm-shared') else 'UCM load'} warmup {warmup['name']} seed={warmup['seed']}",
+                f"\n{'HBM' if self.mode in ('hbm', 'hbm-shared', 'v4hbm') else 'UCM load'} warmup {warmup['name']} seed={warmup['seed']}",
                 flush=True,
             )
             if self.mode != "posix-run":
@@ -679,6 +693,8 @@ class Experiment:
             "metrics_status": "not started",
             "measurement_dir": str(directory),
         }
+        if "expected_hbm_tokens" in case:
+            row["expected_hbm_tokens"] = case["expected_hbm_tokens"]
         prefix = case["seed_tokens"] if self.mode == "hbm-shared" else 0
         inputs = case["input_len"] - prefix
         capture = None
@@ -753,6 +769,12 @@ class Experiment:
                     f"\n{self.mode} {case['name']} seed={case['seed']} seed_tokens={case['seed_tokens']}",
                     flush=True,
                 )
+                if self.mode == "v4hbm":
+                    print(
+                        f"Expected HBM prefix: {case['expected_hbm_tokens']} tokens "
+                        f"({case['expected_hbm_tokens'] / case['input_len']:.2%})",
+                        flush=True,
+                    )
                 if self.mode != "posix-run":
                     self.seed_case(case, directory)
                 if self.mode != "posix-seed":
@@ -791,6 +813,7 @@ def parse_args(argv=None):
         choices=(
             "hbm",
             "hbm-shared",
+            "v4hbm",
             "cache",
             "posix-seed",
             "posix-run",

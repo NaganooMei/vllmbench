@@ -314,6 +314,112 @@ class WorkflowTest(unittest.TestCase):
             all(json.loads(path.read_text())["mode"] == "hbm-shared" for path in rows)
         )
 
+    def test_v4hbm_seeds_aligned_mtp_prefix_on_every_dp_and_exports_plan(self):
+        self.config["ucm_warmup"] = {"enabled": True}
+        self.config["block_tokens"] = 16
+        self.config["cases"] = [
+            dict(
+                input_len=32768,
+                output_len=512,
+                hit_rate=0.9,
+                concurrency=40,
+                num_requests=40,
+            ),
+            dict(
+                input_len=131072,
+                output_len=512,
+                hit_rate=0.9,
+                concurrency=10,
+                num_requests=10,
+            ),
+        ]
+        self.save_config()
+        self.run_mode("v4hbm")
+        manifest = self.manifests("v4hbm")[0]
+        self.assertEqual(manifest["status"], "complete")
+        self.assertEqual(
+            [
+                (case["expected_hbm_tokens"], case["seed_tokens"])
+                for case in manifest["cases"] + manifest["warmups"]
+            ],
+            [(28672, 28704), (114688, 114720), (4096, 4128)],
+        )
+        self.assertFalse(any(kind == "reset" for kind, _ in self.events))
+        for case in manifest["cases"] + manifest["warmups"]:
+            commands = [
+                (kind, command)
+                for kind, command in self.events
+                if kind in ("seed", "warmup_load", "measure")
+                and command[command.index("--seed") + 1] == str(case["seed"])
+            ]
+            seeds = [command for kind, command in commands if kind == "seed"]
+            self.assertEqual(len(seeds), self.config["dp"])
+            for rank, command in enumerate(seeds):
+                for flag, value in (
+                    ("--random-input-len", str(case["seed_tokens"])),
+                    ("--random-prefix-len", "0"),
+                    ("--random-output-len", "1"),
+                    ("--num-prompts", str(case["num_requests"])),
+                    ("--max-concurrency", str(case["concurrency"])),
+                    ("--header", f"X-data-parallel-rank={rank}"),
+                ):
+                    self.assertEqual(command[command.index(flag) + 1], value)
+            loads = [(kind, command) for kind, command in commands if kind != "seed"]
+            self.assertEqual(len(loads), 3 if case["name"].startswith("warmup") else 1)
+            for kind, command in loads:
+                for flag, value in (
+                    ("--random-input-len", str(case["input_len"])),
+                    ("--random-prefix-len", "0"),
+                    ("--random-output-len", str(case["output_len"])),
+                    ("--num-prompts", str(case["num_requests"])),
+                    ("--max-concurrency", str(case["concurrency"])),
+                ):
+                    self.assertEqual(command[command.index(flag) + 1], value)
+                if kind == "measure":
+                    self.assertNotIn("--header", command)
+        rows = [
+            json.loads(p.read_text())
+            for p in (self.root / "results").rglob("case_result.json")
+        ]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["mode"], "v4hbm")
+            self.assertEqual(row["seed_tokens"], row["expected_hbm_tokens"] + 32)
+        csv = (self.root / "results" / "summary.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("expected_hbm_tokens", csv.splitlines()[0])
+        self.assertIn("28704,28672", csv)
+
+    def test_v4hbm_zero_small_and_full_hit_targets_fit_measured_input(self):
+        for length, hit_rate, target, seed_tokens in (
+            (32768, 0, 0, 0),
+            (32768, 0.01, 0, 0),
+            (32768, 1, 28672, 28704),
+            (8224, 1, 8192, 8224),
+            (8192, 1, 4096, 4128),
+            (4096, 1, 0, 0),
+            (16, 1, 0, 0),
+        ):
+            with self.subTest(length=length, hit_rate=hit_rate):
+                case = dict(
+                    input_len=length,
+                    output_len=1,
+                    hit_rate=hit_rate,
+                    concurrency=1,
+                    num_requests=1,
+                )
+                bench.normalize_case(case, "case", 16, "v4hbm")
+                self.assertEqual(case["expected_hbm_tokens"], target)
+                self.assertEqual(case["seed_tokens"], seed_tokens)
+                self.assertLessEqual(seed_tokens, length)
+
+    def test_v4hbm_validates_warmup_seed_offsets(self):
+        self.config["seed"] = 2**32 - 2
+        self.config["ucm_warmup"] = {"enabled": True}
+        self.save_config()
+        args = bench.parse_args(["v4hbm", str(self.config_path)])
+        with self.assertRaisesRegex(ValueError, "case offsets"):
+            bench.load_config(self.config_path, args)
+
     def test_posix_seeds_persist_and_metrics_option_can_change(self):
         self.run_mode("posix-seed", "--collect-metrics")
         seeded = self.manifests("posix-seed")[0]
