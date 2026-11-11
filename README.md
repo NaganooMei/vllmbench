@@ -42,7 +42,23 @@ python bench.py hbm bench.json
 
 先在每个目标 DP 上执行独立的 8K 预热组，再依次处理正式 case。HBM、Cache、Posix 均使用每条请求各自的随机前缀，不设置公共前缀（`--random-prefix-len 0`）。HBM 的流程与 Cache 相同，只是不调用 reset：每个目标 DP 都预埋该 case 的完整请求集合，输入长度为目标命中部分（例如 90%），输出 1 token；随后保留 HBM 缓存，使用相同 seed、相同请求数发送全长正式请求。
 
-各模式的预埋在各 DP 上依次执行，每个 DP 都使用 case 配置的完整并发和请求数，不按 DP 数拆分。例如 40 请求、40 并发、2 DP，会先向 DP0 发 40 请求、并发 40，再向 DP1 发同样的 40 请求、并发 40。正式组仍使用 case 配置中的并发和请求数，默认走内部 LB。各 DP 的 HBM 需要容纳完整预埋集合，否则实际命中率可能低于目标值。原先每 DP 仅发 1 条共享前缀的方案已移除。历史 HBM 结果不会被转换为新方案，比较时应使用重新运行的结果。
+上述非公共前缀模式的预埋在各 DP 上依次执行，每个 DP 都使用 case 配置的完整并发和请求数，不按 DP 数拆分。例如 40 请求、40 并发、2 DP，会先向 DP0 发 40 请求、并发 40，再向 DP1 发同样的 40 请求、并发 40。正式组仍使用 case 配置中的并发和请求数，默认走内部 LB。各 DP 的 HBM 需要容纳完整预埋集合，否则实际命中率可能低于目标值。
+
+## HBM 公共前缀命中
+
+使用相同的 `bench.json`，一次执行其中全部 case：
+
+```bash
+python bench.py hbm-shared bench.json
+```
+
+每个 case 的所有正式请求共享一条随机前缀，长度为 `seed_tokens`，即输入长度乘目标命中率，再按 `block_tokens` 向下取整。每个目标 DP 只预埋 1 条请求、并发 1、输出 1 token，输入为公共前缀加 1 token；正式组保留配置的完整输入长度、输出长度、并发和请求数，默认走内部 LB。全程不调用 reset。支持带 UCM 和不带 UCM 的服务，以及 `--dp-rank` 固定 DP。
+
+例如 32K、90% 命中：预埋使用 `--random-prefix-len 29491 --random-input-len 1`，正式组使用 `--random-prefix-len 29491 --random-input-len 3277`，正式总输入仍为 32768。每个 case 和预热组使用独立 seed，新执行默认生成新 seed。
+
+单请求预埋通过仓库内的 `bench_compat.py` 调用原有 vLLM CLI：按正式请求数生成随机样本以保持公共前缀的随机数状态一致，实际只发送第一条。不能直接把原生命令的 `--num-prompts` 改为 1，否则部分 vLLM 版本生成的公共前缀会改变。
+
+默认独立预热也采用公共前缀，每个 DP 先预埋 1 条，再发送配置中的 8K 预热请求组，默认一轮。正式轮次的命中率、TTFT、TPOT 和吞吐继续自动汇总，表格 Mode 为 `hbm-shared`，与原有 `hbm` 区分。实际命中率仍以指标为准。Cache 和 Posix 继续采用原有的独立前缀方式。
 
 ## UCM Host Cache 命中
 

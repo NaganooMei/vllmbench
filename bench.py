@@ -174,7 +174,7 @@ def load_config(path: Path, args) -> dict:
         offsets = len(cases) + (
             warmup["rounds"]
             if warmup["enabled"]
-            and args.mode in ("hbm", "cache", "posix-seed", "posix-reset")
+            and args.mode in ("hbm", "hbm-shared", "cache", "posix-seed", "posix-reset")
             else 0
         )
         if seed + offsets - 1 >= 2**32:
@@ -403,6 +403,7 @@ class BenchCLI:
         output_len: int,
         concurrency: int,
         rank: int | None,
+        prefix_source_count: int | None = None,
     ) -> dict:
         result_path = directory / f"{label}.json"
         command = [
@@ -444,6 +445,14 @@ class BenchCLI:
         ]
         if rank is not None:
             command += ["--header", f"X-data-parallel-rank={rank}"]
+        if prefix_source_count is not None:
+            command = [
+                sys.executable,
+                str(ROOT / "bench_compat.py"),
+                "--prefix-source-num-prompts",
+                str(prefix_source_count),
+                *command[len(self.command) :],
+            ]
         print(shlex.join(command), flush=True)
         if self.dry_run:
             return {}
@@ -576,15 +585,17 @@ class Experiment:
         if case["seed_tokens"] == 0:
             return
         for rank in self.ranks():
+            shared = self.mode == "hbm-shared"
             result = self.cli.run(
-                case,
+                {**case, "num_requests": 1} if shared else case,
                 directory,
                 f"seed_dp{rank}",
-                case["seed_tokens"],
-                0,
+                1 if shared else case["seed_tokens"],
+                case["seed_tokens"] if shared else 0,
                 1,
-                case["concurrency"],
+                1 if shared else case["concurrency"],
                 rank,
+                prefix_source_count=case["num_requests"] if shared else None,
             )
             if result.get("validation_errors"):
                 raise RuntimeError(
@@ -602,7 +613,7 @@ class Experiment:
         for warmup in self.warmups:
             directory = self.directory / warmup["name"]
             print(
-                f"\n{'HBM' if self.mode == 'hbm' else 'UCM load'} warmup {warmup['name']} seed={warmup['seed']}",
+                f"\n{'HBM' if self.mode in ('hbm', 'hbm-shared') else 'UCM load'} warmup {warmup['name']} seed={warmup['seed']}",
                 flush=True,
             )
             if self.mode != "posix-run":
@@ -615,12 +626,13 @@ class Experiment:
                         reset_external=self.mode == "posix-reset",
                     )
                 for rank in self.ranks():
+                    prefix = warmup["seed_tokens"] if self.mode == "hbm-shared" else 0
                     result = self.cli.run(
                         warmup,
                         directory,
                         f"warmup_load_dp{rank}",
-                        warmup["input_len"],
-                        0,
+                        warmup["input_len"] - prefix,
+                        prefix,
                         warmup["output_len"],
                         warmup["concurrency"],
                         rank,
@@ -667,7 +679,8 @@ class Experiment:
             "metrics_status": "not started",
             "measurement_dir": str(directory),
         }
-        inputs, prefix = case["input_len"], 0
+        prefix = case["seed_tokens"] if self.mode == "hbm-shared" else 0
+        inputs = case["input_len"] - prefix
         capture = None
         result = {}
         try:
@@ -775,7 +788,15 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "mode",
-        choices=("hbm", "cache", "posix-seed", "posix-run", "posix-reset", "report"),
+        choices=(
+            "hbm",
+            "hbm-shared",
+            "cache",
+            "posix-seed",
+            "posix-run",
+            "posix-reset",
+            "report",
+        ),
     )
     parser.add_argument(
         "config",

@@ -264,6 +264,56 @@ class WorkflowTest(unittest.TestCase):
         self.assertFalse(any(kind == "reset" for kind, _ in self.events))
         self.assertFalse(any((self.root / "results").rglob("before.prom")))
 
+    def test_hbm_shared_seeds_one_per_dp_and_preserves_full_measurement(self):
+        self.config["ucm_warmup"] = {"enabled": True}
+        self.save_config()
+        self.run_mode("hbm-shared")
+        manifest = self.manifests("hbm-shared")[0]
+        self.assertEqual(manifest["status"], "complete")
+        self.assertFalse(any(kind == "reset" for kind, _ in self.events))
+        for case in [*manifest["cases"], *manifest["warmups"]]:
+            commands = [
+                (kind, command)
+                for kind, command in self.events
+                if kind in ("seed", "warmup_load", "measure")
+                and command[command.index("--seed") + 1] == str(case["seed"])
+            ]
+            seeds = [command for kind, command in commands if kind == "seed"]
+            self.assertEqual(len(seeds), self.config["dp"])
+            for rank, command in enumerate(seeds):
+                for flag, value in (
+                    ("--header", f"X-data-parallel-rank={rank}"),
+                    ("--num-prompts", "1"),
+                    ("--max-concurrency", "1"),
+                    ("--random-input-len", "1"),
+                    ("--random-output-len", "1"),
+                    ("--random-prefix-len", str(case["seed_tokens"])),
+                    ("--prefix-source-num-prompts", str(case["num_requests"])),
+                ):
+                    self.assertEqual(command[command.index(flag) + 1], value)
+                self.assertTrue(command[1].endswith("bench_compat.py"))
+            loads = [command for kind, command in commands if kind != "seed"]
+            self.assertEqual(len(loads), 3 if case["name"].startswith("warmup") else 1)
+            for command in loads:
+                for flag, value in (
+                    ("--num-prompts", str(case["num_requests"])),
+                    ("--max-concurrency", str(case["concurrency"])),
+                    ("--random-prefix-len", str(case["seed_tokens"])),
+                    (
+                        "--random-input-len",
+                        str(case["input_len"] - case["seed_tokens"]),
+                    ),
+                    ("--random-output-len", str(case["output_len"])),
+                ):
+                    self.assertEqual(command[command.index(flag) + 1], value)
+                if not case["name"].startswith("warmup"):
+                    self.assertNotIn("--header", command)
+        rows = list((self.root / "results").rglob("case_result.json"))
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(
+            all(json.loads(path.read_text())["mode"] == "hbm-shared" for path in rows)
+        )
+
     def test_posix_seeds_persist_and_metrics_option_can_change(self):
         self.run_mode("posix-seed", "--collect-metrics")
         seeded = self.manifests("posix-seed")[0]
@@ -897,6 +947,34 @@ class MetricsTest(unittest.TestCase):
         module.benchmark = lambda: None
         with self.assertRaises(RuntimeError):
             bench_compat.install_probe_override(module)
+
+    def test_shared_seed_preserves_sampling_count_but_sends_one_request(self):
+        import random
+        from types import SimpleNamespace
+
+        def get_samples(args):
+            rng = random.Random(args.seed)
+            for _ in range(args.num_prompts):
+                rng.random()  # Per-request offsets precede the common prefix.
+            prefix = rng.getrandbits(64)
+            return [(prefix, index) for index in range(args.num_prompts)]
+
+        formal = get_samples(SimpleNamespace(seed=2004, num_prompts=40))
+        self.assertNotEqual(
+            formal[0], get_samples(SimpleNamespace(seed=2004, num_prompts=1))[0]
+        )
+        module = SimpleNamespace(get_samples=get_samples)
+        bench_compat.install_prefix_seed_sampling(module, 40)
+        args = SimpleNamespace(seed=2004, num_prompts=1)
+        self.assertEqual(module.get_samples(args), formal[:1])
+        self.assertEqual(args.num_prompts, 1)
+        failing = SimpleNamespace(
+            get_samples=mock.Mock(side_effect=ValueError("sampling"))
+        )
+        bench_compat.install_prefix_seed_sampling(failing, 40)
+        with self.assertRaises(ValueError):
+            failing.get_samples(args)
+        self.assertEqual(args.num_prompts, 1)
 
 
 if __name__ == "__main__":
