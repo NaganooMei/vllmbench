@@ -278,7 +278,12 @@ class WorkflowTest(unittest.TestCase):
                 if kind in ("seed", "warmup_load", "measure")
                 and command[command.index("--seed") + 1] == str(case["seed"])
             ]
-            seeds = [command for kind, command in commands if kind == "seed"]
+            seeds = sorted(
+                (command for kind, command in commands if kind == "seed"),
+                key=lambda command: int(
+                    command[command.index("--header") + 1].split("=")[1]
+                ),
+            )
             self.assertEqual(len(seeds), self.config["dp"])
             for rank, command in enumerate(seeds):
                 for flag, value in (
@@ -313,6 +318,101 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(
             all(json.loads(path.read_text())["mode"] == "hbm-shared" for path in rows)
         )
+
+    def test_shared_seeds_overlap_on_distinct_dp_and_join_before_loading(self):
+        for mode in bench.SHARED_HBM_MODES:
+            with self.subTest(mode=mode):
+                self.assert_parallel_shared_seeding(mode)
+
+    def test_shared_seed_failure_joins_all_dp_and_stops_measurement(self):
+        for mode in bench.SHARED_HBM_MODES:
+            with self.subTest(mode=mode):
+                self.assert_parallel_shared_seeding(mode, failed_rank=1)
+
+    def assert_parallel_shared_seeding(self, mode, failed_rank=None):
+        self.config["dp"] = 4
+        self.config["ucm_warmup"] = {"enabled": failed_rank is None}
+        self.config["cases"] = [
+            dict(
+                input_len=32768,
+                output_len=1,
+                hit_rate=0.9,
+                concurrency=4,
+                num_requests=4,
+            )
+        ]
+        self.save_config()
+        original_process = self.fake_process
+        phases = {}
+        lock = threading.Lock()
+        first_event = len(self.events)
+
+        def parallel_process(command, **kwargs):
+            def option(flag):
+                return command[command.index(flag) + 1]
+
+            seed = option("--seed")
+            label = option("--result-filename")
+            if not label.startswith("seed_dp"):
+                with lock:
+                    self.assertEqual(phases[seed]["finished"], set(range(4)))
+                return original_process(command, **kwargs)
+            rank = int(option("--header").split("=")[1])
+            with lock:
+                phase = phases.setdefault(
+                    seed,
+                    {
+                        "barrier": threading.Barrier(4, timeout=5),
+                        "started": set(),
+                        "finished": set(),
+                    },
+                )
+                self.assertNotIn(rank, phase["started"])
+                phase["started"].add(rank)
+            process = original_process(command, **kwargs)
+            if rank == failed_rank:
+                path = Path(option("--result-dir")) / label
+                result = json.loads(path.read_text(encoding="utf-8"))
+                result["completed"] = 0
+                result["failed"] = 1
+                path.write_text(json.dumps(result), encoding="utf-8")
+
+            def finish(*args, **kwargs):
+                # Serial seeding times out here. Every targeted DP must have
+                # its own running process before any seed is allowed to finish.
+                phase["barrier"].wait()
+                with lock:
+                    phase["finished"].add(rank)
+                return 0
+
+            process.wait.side_effect = finish
+            return process
+
+        with mock.patch.object(self, "fake_process", side_effect=parallel_process):
+            self.run_mode(mode, expected=int(failed_rank is not None))
+        self.assertEqual(len(phases), 2 if failed_rank is None else 1)
+        for phase in phases.values():
+            self.assertEqual(phase["started"], set(range(4)))
+            self.assertEqual(phase["finished"], set(range(4)))
+        manifest = self.manifests(mode)[-1]
+        self.assertEqual(
+            manifest["status"], "complete" if failed_rank is None else "failed"
+        )
+        if failed_rank is not None:
+            self.assertIn("DP1", manifest["error"])
+            self.assertFalse(
+                any(
+                    kind in ("warmup_load", "measure")
+                    for kind, _ in self.events[first_event:]
+                )
+            )
+        for case in manifest["cases"] + manifest["warmups"]:
+            directory = (
+                Path(self.config["results_dir"]) / manifest["run_id"] / case["name"]
+            )
+            for rank in range(4):
+                for suffix in ("json", "command.json", "log"):
+                    self.assertTrue((directory / f"seed_dp{rank}.{suffix}").exists())
 
     def test_v4hbm_seeds_aligned_mtp_prefix_on_every_dp_and_exports_plan(self):
         self.assert_v4_hbm_workflow("v4hbm")
@@ -359,7 +459,12 @@ class WorkflowTest(unittest.TestCase):
                 if kind in ("seed", "warmup_load", "measure")
                 and command[command.index("--seed") + 1] == str(case["seed"])
             ]
-            seeds = [command for kind, command in commands if kind == "seed"]
+            seeds = sorted(
+                (command for kind, command in commands if kind == "seed"),
+                key=lambda command: int(
+                    command[command.index("--header") + 1].split("=")[1]
+                ),
+            )
             self.assertEqual(len(seeds), self.config["dp"])
             for rank, command in enumerate(seeds):
                 for flag, value in (

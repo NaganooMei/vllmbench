@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -600,15 +601,17 @@ class Experiment:
     def seed_case(self, case: dict, directory: Path) -> None:
         if case["seed_tokens"] == 0:
             return
-        for rank in self.ranks():
-            shared = self.mode in SHARED_HBM_MODES
-            # V4's seed_tokens already includes the 32-token MTP tail.
-            # A prefix-only request keeps its total length exactly seed_tokens.
-            seed_input = (
-                (0 if self.mode == "hbm-shared-v4" else 1)
-                if shared
-                else case["seed_tokens"]
-            )
+        ranks = self.ranks()
+        shared = self.mode in SHARED_HBM_MODES
+        # V4's seed_tokens already includes the 32-token MTP tail.
+        # A prefix-only request keeps its total length exactly seed_tokens.
+        seed_input = (
+            (0 if self.mode == "hbm-shared-v4" else 1)
+            if shared
+            else case["seed_tokens"]
+        )
+
+        def seed_rank(rank: int) -> None:
             result = self.cli.run(
                 {**case, "num_requests": 1} if shared else case,
                 directory,
@@ -624,6 +627,16 @@ class Experiment:
                 raise RuntimeError(
                     f"Pre-seeding failed for {case['name']} DP{rank}: {result['validation_errors']}"
                 )
+
+        if shared and len(ranks) > 1 and not self.args.dry_run:
+            print(f"Pre-seeding shared prefix concurrently on DPs {ranks}", flush=True)
+            # Each worker passes an explicit rank to BenchCLI.run, which adds
+            # X-data-parallel-rank. Join all workers before settling/measuring.
+            with ThreadPoolExecutor(max_workers=len(ranks)) as pool:
+                list(pool.map(seed_rank, ranks))
+        else:
+            for rank in ranks:
+                seed_rank(rank)
         if not self.args.dry_run:
             time.sleep(
                 max(
