@@ -31,6 +31,7 @@ V4_HBM_ALIGNMENT = 4096
 V4_HBM_TAIL_TOKENS = 32
 V4_HBM_MODES = ("v4hbm", "hbm-shared-v4")
 SHARED_HBM_MODES = ("hbm-shared", "hbm-shared-v4")
+PARALLEL_SEED_MODES = (*SHARED_HBM_MODES, "cache", "posix-seed", "posix-reset")
 HBM_MODES = ("hbm", "hbm-shared", *V4_HBM_MODES)
 
 
@@ -628,8 +629,12 @@ class Experiment:
                     f"Pre-seeding failed for {case['name']} DP{rank}: {result['validation_errors']}"
                 )
 
-        if shared and len(ranks) > 1 and not self.args.dry_run:
-            print(f"Pre-seeding shared prefix concurrently on DPs {ranks}", flush=True)
+        if (
+            self.mode in PARALLEL_SEED_MODES
+            and len(ranks) > 1
+            and not self.args.dry_run
+        ):
+            print(f"Pre-seeding concurrently on DPs {ranks}", flush=True)
             # Each worker passes an explicit rank to BenchCLI.run, which adds
             # X-data-parallel-rank. Join all workers before settling/measuring.
             with ThreadPoolExecutor(max_workers=len(ranks)) as pool:

@@ -42,7 +42,7 @@ python bench.py hbm bench.json
 
 先在每个目标 DP 上执行独立的 8K 预热组，再依次处理正式 case。HBM、Cache、Posix 均使用每条请求各自的随机前缀，不设置公共前缀（`--random-prefix-len 0`）。HBM 的流程与 Cache 相同，只是不调用 reset：每个目标 DP 都预埋该 case 的完整请求集合，输入长度为目标命中部分（例如 90%），输出 1 token；随后保留 HBM 缓存，使用相同 seed、相同请求数发送全长正式请求。
 
-上述非公共前缀模式的预埋在各 DP 上依次执行，每个 DP 都使用 case 配置的完整并发和请求数，不按 DP 数拆分。例如 40 请求、40 并发、2 DP，会先向 DP0 发 40 请求、并发 40，再向 DP1 发同样的 40 请求、并发 40。正式组仍使用 case 配置中的并发和请求数，默认走内部 LB。各 DP 的 HBM 需要容纳完整预埋集合，否则实际命中率可能低于目标值。
+`hbm` 和 `v4hbm` 的预埋在各 DP 上依次执行，每个 DP 都使用 case 配置的完整并发和请求数，不按 DP 数拆分。例如 40 请求、40 并发、2 DP，会先向 DP0 发 40 请求、并发 40，再向 DP1 发同样的 40 请求、并发 40。正式组仍使用 case 配置中的并发和请求数，默认走内部 LB。各 DP 的 HBM 需要容纳完整预埋集合，否则实际命中率可能低于目标值。Cache 和 Posix 的各 DP 预埋采用下面介绍的并行流程。
 
 ## DeepSeek V4 MTP HBM 命中
 
@@ -107,6 +107,8 @@ python bench.py cache bench.json
 ```
 
 每个 case 的全部请求前缀会在每个 DP 都预埋一遍，然后调用 `POST /reset_prefix_cache?reset_external=false`，清理 HBM 前缀缓存，接着测量。每个 DP 的 Host Cache 需要容纳该 case 的完整预埋集合。reset 返回失败时自动重试至超时。
+
+`cache`、`posix-seed` 和 `posix-reset` 均同时启动各目标 DP 的预埋，每组用独立的 `X-data-parallel-rank` header 指定 DP，输入内容及 seed 相同，每个 DP 保留配置中的完整请求数和并发。例如 DP4、40 请求、40 并发，会同时向四个 DP 各发 40 条，全服务预埋并发最高 160；正式测试仍总共 40 请求、40 并发。预热组的预埋也并行。各 DP 全部成功后等待稳定时间，再执行 reset 或结束预埋；任一 DP 失败则停止该轮，不执行 reset/正式测试，也不会将失败的 Posix 预埋发布为可用记录。不同 case 依次执行，`--dp-rank` 仍只覆盖指定 DP。每个 DP 的结果与日志独立保存。
 
 内部 LB 会把 reset 广播到全部 DP。本地核对的 vLLM 版本只返回第一个 DP 的 reset 结果，还应检查测量窗口中的实际 HBM 命中。
 

@@ -322,14 +322,24 @@ class WorkflowTest(unittest.TestCase):
     def test_shared_seeds_overlap_on_distinct_dp_and_join_before_loading(self):
         for mode in bench.SHARED_HBM_MODES:
             with self.subTest(mode=mode):
-                self.assert_parallel_shared_seeding(mode)
+                self.assert_parallel_seeding(mode)
 
     def test_shared_seed_failure_joins_all_dp_and_stops_measurement(self):
         for mode in bench.SHARED_HBM_MODES:
             with self.subTest(mode=mode):
-                self.assert_parallel_shared_seeding(mode, failed_rank=1)
+                self.assert_parallel_seeding(mode, failed_rank=1)
 
-    def assert_parallel_shared_seeding(self, mode, failed_rank=None):
+    def test_cache_and_posix_seed_full_sets_concurrently_on_distinct_dp(self):
+        for mode in ("cache", "posix-seed", "posix-reset"):
+            with self.subTest(mode=mode):
+                self.assert_parallel_seeding(mode)
+
+    def test_cache_and_posix_seed_failure_stops_reset_and_measurement(self):
+        for mode in ("cache", "posix-seed", "posix-reset"):
+            with self.subTest(mode=mode):
+                self.assert_parallel_seeding(mode, failed_rank=1)
+
+    def assert_parallel_seeding(self, mode, failed_rank=None):
         self.config["dp"] = 4
         self.config["ucm_warmup"] = {"enabled": failed_rank is None}
         self.config["cases"] = [
@@ -337,8 +347,8 @@ class WorkflowTest(unittest.TestCase):
                 input_len=32768,
                 output_len=1,
                 hit_rate=0.9,
-                concurrency=4,
-                num_requests=4,
+                concurrency=40,
+                num_requests=40,
             )
         ]
         self.save_config()
@@ -358,6 +368,14 @@ class WorkflowTest(unittest.TestCase):
                     self.assertEqual(phases[seed]["finished"], set(range(4)))
                 return original_process(command, **kwargs)
             rank = int(option("--header").split("=")[1])
+            shared = mode in bench.SHARED_HBM_MODES
+            warmup = "warmup_001" in option("--result-dir")
+            count = 1 if shared else (4 if warmup else 40)
+            self.assertEqual(option("--num-prompts"), str(count))
+            self.assertEqual(option("--max-concurrency"), str(count))
+            self.assertEqual(option("--random-output-len"), "1")
+            if not shared:
+                self.assertEqual(option("--random-prefix-len"), "0")
             with lock:
                 phase = phases.setdefault(
                     seed,
@@ -396,16 +414,25 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(phase["finished"], set(range(4)))
         manifest = self.manifests(mode)[-1]
         self.assertEqual(
-            manifest["status"], "complete" if failed_rank is None else "failed"
+            manifest["status"],
+            (
+                ("seeded" if mode == "posix-seed" else "complete")
+                if failed_rank is None
+                else "failed"
+            ),
         )
         if failed_rank is not None:
             self.assertIn("DP1", manifest["error"])
             self.assertFalse(
                 any(
-                    kind in ("warmup_load", "measure")
+                    kind in ("reset", "snapshot", "warmup_load", "measure")
                     for kind, _ in self.events[first_event:]
                 )
             )
+            if mode == "posix-seed":
+                self.assertFalse(
+                    list(Path(self.config["results_dir"]).glob(".posix_pending_*.json"))
+                )
         for case in manifest["cases"] + manifest["warmups"]:
             directory = (
                 Path(self.config["results_dir"]) / manifest["run_id"] / case["name"]
@@ -617,8 +644,13 @@ class WorkflowTest(unittest.TestCase):
                 measurement[measurement.index("--random-input-len") + 1],
                 str(case["input_len"]),
             )
-            for rank in range(3):
-                seed = seeds[index * 3 + rank]
+            case_seeds = sorted(
+                seeds[index * 3 : (index + 1) * 3],
+                key=lambda command: int(
+                    command[command.index("--header") + 1].split("=")[1]
+                ),
+            )
+            for rank, seed in enumerate(case_seeds):
                 self.assertEqual(
                     seed[seed.index("--header") + 1], f"X-data-parallel-rank={rank}"
                 )
@@ -742,8 +774,13 @@ class WorkflowTest(unittest.TestCase):
         for index, (length, count, seed) in enumerate(
             [(32768, 40, 2004), (131072, 10, 2005)]
         ):
-            for rank in (0, 1):
-                command = seed_commands[index * 2 + rank]
+            case_seeds = sorted(
+                seed_commands[index * 2 : (index + 1) * 2],
+                key=lambda command: int(
+                    command[command.index("--header") + 1].split("=")[1]
+                ),
+            )
+            for rank, command in enumerate(case_seeds):
                 for flag, value in [
                     ("--random-input-len", length * 9 // 10),
                     ("--random-prefix-len", 0),
