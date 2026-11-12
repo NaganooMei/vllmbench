@@ -387,18 +387,30 @@ class WorkflowTest(unittest.TestCase):
         )
         self.assertEqual(self.manifests("hbm-shared-v4")[0]["status"], "failed")
 
-    def test_cache_and_posix_seed_full_sets_concurrently_on_distinct_dp(self):
-        for mode in ("cache", "posix-seed", "posix-reset"):
-            with self.subTest(mode=mode):
-                self.assert_parallel_seeding(mode)
+    def test_cache_seeds_full_sets_concurrently_on_distinct_dp(self):
+        self.assert_parallel_seeding("cache")
 
-    def test_cache_and_posix_seed_failure_stops_reset_and_measurement(self):
-        for mode in ("cache", "posix-seed", "posix-reset"):
-            with self.subTest(mode=mode):
-                self.assert_parallel_seeding(mode, failed_rank=1)
+    def test_cache_seed_failure_stops_reset_and_measurement(self):
+        self.assert_parallel_seeding("cache", failed_rank=1)
 
-    def assert_parallel_seeding(self, mode, failed_rank=None):
+    def test_posix_seeds_full_set_once_on_default_or_fixed_dp(self):
+        for mode in ("posix-seed", "posix-reset"):
+            for rank in (None, 2):
+                with self.subTest(mode=mode, rank=rank):
+                    self.assert_parallel_seeding(mode, fixed_rank=rank)
+
+    def test_posix_single_seed_failure_stops_reset_and_measurement(self):
+        for mode in ("posix-seed", "posix-reset"):
+            with self.subTest(mode=mode):
+                self.assert_parallel_seeding(mode, failed_rank=0)
+
+    def assert_parallel_seeding(self, mode, failed_rank=None, fixed_rank=None):
         self.config["dp"] = 4
+        seed_ranks = (
+            [fixed_rank]
+            if fixed_rank is not None
+            else ([0] if mode in ("posix-seed", "posix-reset") else list(range(4)))
+        )
         self.config["ucm_warmup"] = {"enabled": failed_rank is None}
         self.config["cases"] = [
             dict(
@@ -423,9 +435,10 @@ class WorkflowTest(unittest.TestCase):
             label = option("--result-filename")
             if not label.startswith("seed_dp"):
                 with lock:
-                    self.assertEqual(phases[seed]["finished"], set(range(4)))
+                    self.assertEqual(phases[seed]["finished"], set(seed_ranks))
                 return original_process(command, **kwargs)
             rank = int(option("--header").split("=")[1])
+            self.assertIn(rank, seed_ranks)
             shared = mode in bench.SHARED_HBM_MODES
             warmup = "warmup_001" in option("--result-dir")
             count = 1 if shared else (4 if warmup else 40)
@@ -438,7 +451,7 @@ class WorkflowTest(unittest.TestCase):
                 phase = phases.setdefault(
                     seed,
                     {
-                        "barrier": threading.Barrier(4, timeout=5),
+                        "barrier": threading.Barrier(len(seed_ranks), timeout=5),
                         "started": set(),
                         "finished": set(),
                     },
@@ -465,12 +478,17 @@ class WorkflowTest(unittest.TestCase):
             return process
 
         with mock.patch.object(self, "fake_process", side_effect=parallel_process):
-            self.run_mode(mode, expected=int(failed_rank is not None))
+            options = ("--dp-rank", str(fixed_rank)) if fixed_rank is not None else ()
+            self.run_mode(mode, *options, expected=int(failed_rank is not None))
         self.assertEqual(len(phases), 2 if failed_rank is None else 1)
         for phase in phases.values():
-            self.assertEqual(phase["started"], set(range(4)))
-            self.assertEqual(phase["finished"], set(range(4)))
-        manifest = self.manifests(mode)[-1]
+            self.assertEqual(phase["started"], set(seed_ranks))
+            self.assertEqual(phase["finished"], set(seed_ranks))
+        manifest = next(
+            item
+            for item in self.manifests(mode)
+            if str(item["cases"][0]["seed"]) in phases
+        )
         self.assertEqual(
             manifest["status"],
             (
@@ -480,7 +498,7 @@ class WorkflowTest(unittest.TestCase):
             ),
         )
         if failed_rank is not None:
-            self.assertIn("DP1", manifest["error"])
+            self.assertIn(f"DP{failed_rank}", manifest["error"])
             self.assertFalse(
                 any(
                     kind in ("reset", "snapshot", "warmup_load", "measure")
@@ -495,7 +513,7 @@ class WorkflowTest(unittest.TestCase):
             directory = (
                 Path(self.config["results_dir"]) / manifest["run_id"] / case["name"]
             )
-            for rank in range(4):
+            for rank in seed_ranks:
                 for suffix in ("json", "command.json", "log"):
                     self.assertTrue((directory / f"seed_dp{rank}.{suffix}").exists())
 
@@ -680,11 +698,11 @@ class WorkflowTest(unittest.TestCase):
         self.save_config()
         self.run_mode("posix-run", expected=1)
 
-    def test_posix_reset_seeds_all_dp_clears_both_tiers_then_measures(self):
+    def test_posix_reset_seeds_once_clears_both_tiers_then_measures(self):
         self.run_mode("posix-reset", "--collect-metrics")
         self.assertEqual(
             [kind for kind, _ in self.events],
-            ["seed", "seed", "seed", "reset", "snapshot", "measure", "snapshot"] * 2,
+            ["seed", "reset", "snapshot", "measure", "snapshot"] * 2,
         )
         self.assertEqual(
             [value for kind, value in self.events if kind == "reset"],
@@ -702,24 +720,16 @@ class WorkflowTest(unittest.TestCase):
                 measurement[measurement.index("--random-input-len") + 1],
                 str(case["input_len"]),
             )
-            case_seeds = sorted(
-                seeds[index * 3 : (index + 1) * 3],
-                key=lambda command: int(
-                    command[command.index("--header") + 1].split("=")[1]
-                ),
+            seed = seeds[index]
+            self.assertEqual(seed[seed.index("--header") + 1], "X-data-parallel-rank=0")
+            self.assertEqual(
+                seed[seed.index("--random-input-len") + 1], str(case["seed_tokens"])
             )
-            for rank, seed in enumerate(case_seeds):
+            for flag in ("--seed", "--num-prompts"):
                 self.assertEqual(
-                    seed[seed.index("--header") + 1], f"X-data-parallel-rank={rank}"
+                    seed[seed.index(flag) + 1],
+                    measurement[measurement.index(flag) + 1],
                 )
-                self.assertEqual(
-                    seed[seed.index("--random-input-len") + 1], str(case["seed_tokens"])
-                )
-                for flag in ("--seed", "--num-prompts"):
-                    self.assertEqual(
-                        seed[seed.index(flag) + 1],
-                        measurement[measurement.index(flag) + 1],
-                    )
         rows = [
             json.loads(path.read_text())
             for path in (self.root / "results").rglob("case_result.json")
@@ -761,7 +771,7 @@ class WorkflowTest(unittest.TestCase):
         self.save_config()
         self.reset_failures = 1
         self.run_mode("posix-reset", expected=1)
-        self.assertEqual([kind for kind, _ in self.events], ["seed"] * 3 + ["reset"])
+        self.assertEqual([kind for kind, _ in self.events], ["seed", "reset"])
         self.assertEqual(self.manifests("posix-reset")[0]["status"], "failed")
 
     def test_empty_reset_200_stops_cache_and_posix_reset_before_measurement(self):
@@ -771,7 +781,8 @@ class WorkflowTest(unittest.TestCase):
                 self.events.clear()
                 self.run_mode(mode, expected=1)
                 self.assertEqual(
-                    [kind for kind, _ in self.events], ["seed"] * 3 + ["reset"]
+                    [kind for kind, _ in self.events],
+                    ["seed"] * (3 if mode == "cache" else 1) + ["reset"],
                 )
                 manifest = self.manifests(mode)[0]
                 self.assertEqual(manifest["status"], "failed")
@@ -824,6 +835,7 @@ class WorkflowTest(unittest.TestCase):
         self.save_config()
         self.run_mode("posix-seed")
         seed_commands = [command for kind, command in self.events if kind == "seed"]
+        self.assertEqual(len(seed_commands), 2)
         self.events.clear()
         self.run_mode("posix-run")
         measured_commands = [
@@ -832,23 +844,17 @@ class WorkflowTest(unittest.TestCase):
         for index, (length, count, seed) in enumerate(
             [(32768, 40, 2004), (131072, 10, 2005)]
         ):
-            case_seeds = sorted(
-                seed_commands[index * 2 : (index + 1) * 2],
-                key=lambda command: int(
-                    command[command.index("--header") + 1].split("=")[1]
-                ),
-            )
-            for rank, command in enumerate(case_seeds):
-                for flag, value in [
-                    ("--random-input-len", length * 9 // 10),
-                    ("--random-prefix-len", 0),
-                    ("--random-output-len", 1),
-                    ("--num-prompts", count),
-                    ("--max-concurrency", count),
-                    ("--seed", seed),
-                    ("--header", f"X-data-parallel-rank={rank}"),
-                ]:
-                    self.assertEqual(command[command.index(flag) + 1], str(value))
+            command = seed_commands[index]
+            for flag, value in [
+                ("--random-input-len", length * 9 // 10),
+                ("--random-prefix-len", 0),
+                ("--random-output-len", 1),
+                ("--num-prompts", count),
+                ("--max-concurrency", count),
+                ("--seed", seed),
+                ("--header", "X-data-parallel-rank=0"),
+            ]:
+                self.assertEqual(command[command.index(flag) + 1], str(value))
             command = measured_commands[index]
             for flag, value in [
                 ("--random-input-len", length),
@@ -988,7 +994,7 @@ class WorkflowTest(unittest.TestCase):
         self.run_mode("posix-seed")
         source = self.manifests("posix-seed")[0]
         self.assertEqual(len(source["warmups"]), 2)
-        self.assertEqual(len(self.events), 12)
+        self.assertEqual(len(self.events), 4)
         self.assertTrue(all(event[0] == "seed" for event in self.events))
         self.events.clear()
         self.run_mode("posix-run", "--collect-metrics")

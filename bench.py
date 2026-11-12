@@ -31,7 +31,7 @@ V4_HBM_ALIGNMENT = 4096
 V4_HBM_TAIL_TOKENS = 32
 V4_HBM_MODES = ("v4hbm", "hbm-shared-v4")
 SHARED_HBM_MODES = ("hbm-shared", "hbm-shared-v4")
-PARALLEL_SEED_MODES = ("hbm-shared", "cache", "posix-seed", "posix-reset")
+PARALLEL_SEED_MODES = ("hbm-shared", "cache")
 HBM_MODES = ("hbm", "hbm-shared", *V4_HBM_MODES)
 
 
@@ -603,6 +603,9 @@ class Experiment:
         if case["seed_tokens"] == 0:
             return
         ranks = self.ranks()
+        if self.mode in ("posix-seed", "posix-reset"):
+            # All DP ranks reuse the same backend files and KV key namespace.
+            ranks = ranks[:1]
         shared = self.mode in SHARED_HBM_MODES
         # V4's seed_tokens already includes the 32-token MTP tail.
         # A prefix-only request keeps its total length exactly seed_tokens.
