@@ -82,6 +82,18 @@ python bench.py hbm-shared bench.json
 
 默认独立预热也采用公共前缀，每个 DP 先预埋 1 条，再发送配置中的 8K 预热请求组，默认一轮。正式轮次的命中率、TTFT、TPOT 和吞吐继续自动汇总，表格 Mode 为 `hbm-shared`，与原有 `hbm` 区分。实际命中率仍以指标为准。Cache 和 Posix 继续采用原有的独立前缀方式。
 
+## DeepSeek V4 MTP 公共前缀命中
+
+```bash
+python bench.py hbm-shared-v4 bench.json
+```
+
+结合公共前缀和 `v4hbm` 的 4096 向下取整再加 32 规则。每个 case 的所有请求共享 `seed_tokens` 长度的前缀，每个目标 DP 只预埋 1 条、并发 1、输出 1 token，全程不调用 reset。预埋和正式组使用相同 seed，并按正式请求数生成样本后只发送第一条预埋请求，以保持公共前缀一致。
+
+例如正式输入 32768、目标 90%，预期 HBM token 为 28672，公共前缀和预埋总输入均为 28704。预埋使用 `--random-prefix-len 28704 --random-input-len 0`；正式组使用 `--random-prefix-len 28704 --random-input-len 4064`，保留配置中的请求数、并发及输出长度。vLLM 的 random 数据集支持非空公共前缀加零长度独立部分。正式请求默认走内部 LB，也支持 `--dp-rank`。
+
+默认一轮独立 8K 预热同样按该规则执行，公共前缀及预埋输入为 4128，预期 HBM token 为 4096。100% 和小输入的边界处理与 `v4hbm` 相同；取整为 0 时跳过预埋。汇总 Mode 为 `hbm-shared-v4`，并记录实际预埋长度及预期 HBM token。32K、90% 对应的预期 HBM 比例为 87.5%，实际命中率仍以正式组指标为准。此模式沿用已验证的 V4 边界规则，公共前缀组合尚需目标服务验证。
+
 ## UCM Host Cache 命中
 
 在 UCM 服务上执行一次。

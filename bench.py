@@ -28,6 +28,9 @@ from reporting import performance, write_summary
 ROOT = Path(__file__).resolve().parent
 V4_HBM_ALIGNMENT = 4096
 V4_HBM_TAIL_TOKENS = 32
+V4_HBM_MODES = ("v4hbm", "hbm-shared-v4")
+SHARED_HBM_MODES = ("hbm-shared", "hbm-shared-v4")
+HBM_MODES = ("hbm", "hbm-shared", *V4_HBM_MODES)
 
 
 def save_json(path: Path, value) -> None:
@@ -57,7 +60,7 @@ def normalize_case(case: dict, label: str, block: int, mode: str = "") -> None:
         raise ValueError(f"{label} hit_rate must be between 0 and 1")
     if case["concurrency"] > case["num_requests"]:
         raise ValueError(f"{label} concurrency exceeds num_requests")
-    if mode == "v4hbm":
+    if mode in V4_HBM_MODES:
         # MTP's 32-token tail is matched and dropped before the HBM hit.
         # Keep the entire seeded prefix within the measured input at 100%.
         available = min(
@@ -187,8 +190,7 @@ def load_config(path: Path, args) -> dict:
         offsets = len(cases) + (
             warmup["rounds"]
             if warmup["enabled"]
-            and args.mode
-            in ("hbm", "hbm-shared", "v4hbm", "cache", "posix-seed", "posix-reset")
+            and args.mode in (*HBM_MODES, "cache", "posix-seed", "posix-reset")
             else 0
         )
         if seed + offsets - 1 >= 2**32:
@@ -599,12 +601,19 @@ class Experiment:
         if case["seed_tokens"] == 0:
             return
         for rank in self.ranks():
-            shared = self.mode == "hbm-shared"
+            shared = self.mode in SHARED_HBM_MODES
+            # V4's seed_tokens already includes the 32-token MTP tail.
+            # A prefix-only request keeps its total length exactly seed_tokens.
+            seed_input = (
+                (0 if self.mode == "hbm-shared-v4" else 1)
+                if shared
+                else case["seed_tokens"]
+            )
             result = self.cli.run(
                 {**case, "num_requests": 1} if shared else case,
                 directory,
                 f"seed_dp{rank}",
-                1 if shared else case["seed_tokens"],
+                seed_input,
                 case["seed_tokens"] if shared else 0,
                 1,
                 1 if shared else case["concurrency"],
@@ -627,7 +636,7 @@ class Experiment:
         for warmup in self.warmups:
             directory = self.directory / warmup["name"]
             print(
-                f"\n{'HBM' if self.mode in ('hbm', 'hbm-shared', 'v4hbm') else 'UCM load'} warmup {warmup['name']} seed={warmup['seed']}",
+                f"\n{'HBM' if self.mode in HBM_MODES else 'UCM load'} warmup {warmup['name']} seed={warmup['seed']}",
                 flush=True,
             )
             if self.mode != "posix-run":
@@ -640,7 +649,9 @@ class Experiment:
                         reset_external=self.mode == "posix-reset",
                     )
                 for rank in self.ranks():
-                    prefix = warmup["seed_tokens"] if self.mode == "hbm-shared" else 0
+                    prefix = (
+                        warmup["seed_tokens"] if self.mode in SHARED_HBM_MODES else 0
+                    )
                     result = self.cli.run(
                         warmup,
                         directory,
@@ -695,7 +706,7 @@ class Experiment:
         }
         if "expected_hbm_tokens" in case:
             row["expected_hbm_tokens"] = case["expected_hbm_tokens"]
-        prefix = case["seed_tokens"] if self.mode == "hbm-shared" else 0
+        prefix = case["seed_tokens"] if self.mode in SHARED_HBM_MODES else 0
         inputs = case["input_len"] - prefix
         capture = None
         result = {}
@@ -769,7 +780,7 @@ class Experiment:
                     f"\n{self.mode} {case['name']} seed={case['seed']} seed_tokens={case['seed_tokens']}",
                     flush=True,
                 )
-                if self.mode == "v4hbm":
+                if self.mode in V4_HBM_MODES:
                     print(
                         f"Expected HBM prefix: {case['expected_hbm_tokens']} tokens "
                         f"({case['expected_hbm_tokens'] / case['input_len']:.2%})",
@@ -813,6 +824,7 @@ def parse_args(argv=None):
         choices=(
             "hbm",
             "hbm-shared",
+            "hbm-shared-v4",
             "v4hbm",
             "cache",
             "posix-seed",

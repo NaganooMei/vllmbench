@@ -54,7 +54,7 @@ RATE_FIELDS = {name for name in FIELDS if "rate" in name or "fraction" in name}
 DEFINITIONS = (
     (
         "Expected HBM tokens",
-        "v4hbm planned reusable prefix, rounded down to 4096 tokens. seed_tokens includes an extra 32-token MTP tail. Actual HBM hit rate comes from measured counters.",
+        "v4hbm / hbm-shared-v4 planned reusable prefix, rounded down to 4096 tokens. seed_tokens includes an extra 32-token MTP tail. Actual HBM hit rate comes from measured counters.",
     ),
     (
         "TPOT mean ms",
