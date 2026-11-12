@@ -393,7 +393,7 @@ class WorkflowTest(unittest.TestCase):
     def test_cache_seed_failure_stops_reset_and_measurement(self):
         self.assert_parallel_seeding("cache", failed_rank=1)
 
-    def test_posix_seeds_full_set_once_on_default_or_fixed_dp(self):
+    def test_posix_seeds_full_set_once_with_auto_lb_or_fixed_dp(self):
         for mode in ("posix-seed", "posix-reset"):
             for rank in (None, 2):
                 with self.subTest(mode=mode, rank=rank):
@@ -402,14 +402,14 @@ class WorkflowTest(unittest.TestCase):
     def test_posix_single_seed_failure_stops_reset_and_measurement(self):
         for mode in ("posix-seed", "posix-reset"):
             with self.subTest(mode=mode):
-                self.assert_parallel_seeding(mode, failed_rank=0)
+                self.assert_parallel_seeding(mode, failed_rank="auto")
 
     def assert_parallel_seeding(self, mode, failed_rank=None, fixed_rank=None):
         self.config["dp"] = 4
         seed_ranks = (
             [fixed_rank]
             if fixed_rank is not None
-            else ([0] if mode in ("posix-seed", "posix-reset") else list(range(4)))
+            else (["auto"] if mode in ("posix-seed", "posix-reset") else list(range(4)))
         )
         self.config["ucm_warmup"] = {"enabled": failed_rank is None}
         self.config["cases"] = [
@@ -433,11 +433,15 @@ class WorkflowTest(unittest.TestCase):
 
             seed = option("--seed")
             label = option("--result-filename")
-            if not label.startswith("seed_dp"):
+            if not label.startswith("seed_"):
                 with lock:
                     self.assertEqual(phases[seed]["finished"], set(seed_ranks))
                 return original_process(command, **kwargs)
-            rank = int(option("--header").split("=")[1])
+            rank = (
+                int(option("--header").split("=")[1])
+                if "--header" in command
+                else "auto"
+            )
             self.assertIn(rank, seed_ranks)
             shared = mode in bench.SHARED_HBM_MODES
             warmup = "warmup_001" in option("--result-dir")
@@ -498,7 +502,8 @@ class WorkflowTest(unittest.TestCase):
             ),
         )
         if failed_rank is not None:
-            self.assertIn(f"DP{failed_rank}", manifest["error"])
+            target = "auto LB" if failed_rank == "auto" else f"DP{failed_rank}"
+            self.assertIn(target, manifest["error"])
             self.assertFalse(
                 any(
                     kind in ("reset", "snapshot", "warmup_load", "measure")
@@ -514,8 +519,9 @@ class WorkflowTest(unittest.TestCase):
                 Path(self.config["results_dir"]) / manifest["run_id"] / case["name"]
             )
             for rank in seed_ranks:
+                label = "seed_auto" if rank == "auto" else f"seed_dp{rank}"
                 for suffix in ("json", "command.json", "log"):
-                    self.assertTrue((directory / f"seed_dp{rank}.{suffix}").exists())
+                    self.assertTrue((directory / f"{label}.{suffix}").exists())
 
     def test_v4hbm_seeds_aligned_mtp_prefix_on_every_dp_and_exports_plan(self):
         self.assert_v4_hbm_workflow("v4hbm")
@@ -721,7 +727,7 @@ class WorkflowTest(unittest.TestCase):
                 str(case["input_len"]),
             )
             seed = seeds[index]
-            self.assertEqual(seed[seed.index("--header") + 1], "X-data-parallel-rank=0")
+            self.assertNotIn("--header", seed)
             self.assertEqual(
                 seed[seed.index("--random-input-len") + 1], str(case["seed_tokens"])
             )
@@ -852,9 +858,9 @@ class WorkflowTest(unittest.TestCase):
                 ("--num-prompts", count),
                 ("--max-concurrency", count),
                 ("--seed", seed),
-                ("--header", "X-data-parallel-rank=0"),
             ]:
                 self.assertEqual(command[command.index(flag) + 1], str(value))
+            self.assertNotIn("--header", command)
             command = measured_commands[index]
             for flag, value in [
                 ("--random-input-len", length),

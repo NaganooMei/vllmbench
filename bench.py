@@ -605,7 +605,7 @@ class Experiment:
         ranks = self.ranks()
         if self.mode in ("posix-seed", "posix-reset"):
             # All DP ranks reuse the same backend files and KV key namespace.
-            ranks = ranks[:1]
+            ranks = ranks[:1] if self.config["routing"]["mode"] == "fixed" else [None]
         shared = self.mode in SHARED_HBM_MODES
         # V4's seed_tokens already includes the 32-token MTP tail.
         # A prefix-only request keeps its total length exactly seed_tokens.
@@ -615,11 +615,12 @@ class Experiment:
             else case["seed_tokens"]
         )
 
-        def seed_rank(rank: int) -> None:
+        def seed_rank(rank: int | None) -> None:
+            label = "seed_auto" if rank is None else f"seed_dp{rank}"
             result = self.cli.run(
                 {**case, "num_requests": 1} if shared else case,
                 directory,
-                f"seed_dp{rank}",
+                label,
                 seed_input,
                 case["seed_tokens"] if shared else 0,
                 1,
@@ -628,8 +629,9 @@ class Experiment:
                 prefix_source_count=case["num_requests"] if shared else None,
             )
             if result.get("validation_errors"):
+                target = "auto LB" if rank is None else f"DP{rank}"
                 raise RuntimeError(
-                    f"Pre-seeding failed for {case['name']} DP{rank}: {result['validation_errors']}"
+                    f"Pre-seeding failed for {case['name']} {target}: {result['validation_errors']}"
                 )
 
         if (

@@ -42,7 +42,7 @@ python bench.py hbm bench.json
 
 先在每个目标 DP 上执行独立的 8K 预热组，再依次处理正式 case。HBM、Cache、Posix 均使用每条请求各自的随机前缀，不设置公共前缀（`--random-prefix-len 0`）。HBM 的流程与 Cache 相同，只是不调用 reset：每个目标 DP 都预埋该 case 的完整请求集合，输入长度为目标命中部分（例如 90%），输出 1 token；随后保留 HBM 缓存，使用相同 seed、相同请求数发送全长正式请求。
 
-`hbm` 和 `v4hbm` 的预埋在各 DP 上依次执行，每个 DP 都使用 case 配置的完整并发和请求数，不按 DP 数拆分。例如 40 请求、40 并发、2 DP，会先向 DP0 发 40 请求、并发 40，再向 DP1 发同样的 40 请求、并发 40。正式组仍使用 case 配置中的并发和请求数，默认走内部 LB。各 DP 的 HBM 需要容纳完整预埋集合，否则实际命中率可能低于目标值。Cache 的各 DP 预埋采用并行流程，Posix 在一个 DP 上预埋完整集合一次，详见下文。
+`hbm` 和 `v4hbm` 的预埋在各 DP 上依次执行，每个 DP 都使用 case 配置的完整并发和请求数，不按 DP 数拆分。例如 40 请求、40 并发、2 DP，会先向 DP0 发 40 请求、并发 40，再向 DP1 发同样的 40 请求、并发 40。正式组仍使用 case 配置中的并发和请求数，默认走内部 LB。各 DP 的 HBM 需要容纳完整预埋集合，否则实际命中率可能低于目标值。Cache 的各 DP 预埋采用并行流程，Posix 将完整集合一次交给内部 LB 分发，详见下文。
 
 ## DeepSeek V4 MTP HBM 命中
 
@@ -116,7 +116,7 @@ python bench.py cache bench.json
 
 第一条命令预埋全部 case，等待 UCM 写出完成后正常停服，保留 Posix 文件和相同的 key 配置并重启服务，再执行第二条命令。
 
-各 DP 需要访问相同的 Posix 文件并使用兼容的 KV key/分片配置。每个 case 只在 DP0 预埋完整请求集合一次，保留配置中的完整请求数和并发，输出 1 token；例如 DP4、40 请求、40 并发，总共只预埋 40 条。预热数据也只预埋一组。`--dp-rank` 或固定路由配置会改为在指定 DP 上预埋。失败的预埋不会发布为可用记录。重启后的加载预热覆盖各目标 DP，正式组默认走内部 LB。
+各 DP 需要访问相同的 Posix 文件并使用兼容的 KV key/分片配置。每个 case 只发送完整请求集合一次，默认由内部 LB 分配到各 DP，保留配置中的完整请求数和并发，输出 1 token。例如 DP4、40 请求、40 并发，总共预埋 40 条。预热数据也只预埋一组并走内部 LB。自动路由的预埋命令省略 rank header，命令、日志和结果保存为 `seed_auto.*`。`--dp-rank` 或固定路由配置会改为在指定 DP 上预埋，保存为 `seed_dp<rank>.*`。失败的预埋不会发布为可用记录。重启后的加载预热覆盖各目标 DP，正式组默认走内部 LB。
 
 ```bash
 python bench.py posix-seed bench.json
@@ -134,7 +134,7 @@ python bench.py posix-run bench.json
 python bench.py posix-reset bench.json
 ```
 
-一条命令自动执行独立加载预热，再对每个 case 在 DP0 预埋完整请求集合的目标前缀一次（例如 90% 输入），使用配置中的完整请求数和并发。固定路由时改用指定 DP。等待 `seed_settle_seconds` 后调用下面的接口，成功后用相同 seed 和相同请求数发送全长正式请求：
+一条命令自动执行独立加载预热，再对每个 case 将完整请求集合的目标前缀一次交给内部 LB 预埋（例如 90% 输入），使用配置中的完整请求数和并发。固定路由时使用指定 DP。等待 `seed_settle_seconds` 后调用下面的接口，成功后用相同 seed 和相同请求数发送全长正式请求：
 
 ```bash
 curl -X POST 'http://localhost:18081/reset_prefix_cache?reset_external=true'
@@ -144,13 +144,13 @@ curl -X POST 'http://localhost:18081/reset_prefix_cache?reset_external=true'
 
 Cache 和 `posix-reset` 模式都严格检查响应体：只有 `{"success": true}` 或 JSON 布尔值 `true` 才继续；明确返回 `false` 时重试。空 HTTP 200、无效 JSON、缺少布尔型 `success` 等情况立即报错，不能验证清理结果时不进入正式测试。旧服务需要修改 reset 接口以返回引擎清理结果。终端会打印 `Reset response: success=true/false (reset_external=...)`，方便核对；客户端仍受服务端 DP 返回值聚合范围限制。
 
-预热组同样只在一个 DP 预埋一次，再清 HBM 和 UCM Cache，然后向各目标 DP 执行加载预热。每个正式 case 的计数窗口从 reset 成功之后开始，预热和清理不计入正式性能结果。汇总表的 Mode 为 `posix-reset`，与停服重启的 `posix` 组区分；支持默认 DP0 预埋加自动 LB、`--dp-rank` 和 `--collect-metrics`。各 DP 需要访问相同的 Posix 文件并使用兼容的 KV key/分片配置。
+预热组同样整组预埋一次并走内部 LB，再清 HBM 和 UCM Cache，然后向各目标 DP 执行加载预热。每个正式 case 的计数窗口从 reset 成功之后开始，预热和清理不计入正式性能结果。汇总表的 Mode 为 `posix-reset`，与停服重启的 `posix` 组区分，支持 `--dp-rank` 和 `--collect-metrics`。各 DP 需要访问相同的 Posix 文件并使用兼容的 KV key/分片配置。
 
 HBM hit、External hit、Host Ready 和 Posix bytes 可用于核对加载来源；接口成功不等同于已验证 Posix 命中。此流程清的是 UCM 内存缓存，不清操作系统文件页缓存，因此不能视为与服务重启完全相同的底层 I/O 冷态。
 
 ## 自动 LB 和固定 DP
 
-自动路由下，HBM 和 Cache 的预埋覆盖每个 DP，Posix 的预埋只使用 DP0。正式请求交给内部 LB 分配。固定 DP 可通过命令行选择。
+自动路由下，HBM 和 Cache 的预埋覆盖每个 DP，Posix 的预埋整组交给内部 LB 分配。正式请求也交给内部 LB 分配。固定 DP 可通过命令行选择。
 
 ```bash
 python bench.py cache bench.json --dp-rank 0
