@@ -44,6 +44,18 @@ python bench.py hbm bench.json
 
 `hbm` 和 `v4hbm` 的预埋在各 DP 上依次执行，每个 DP 都使用 case 配置的完整并发和请求数，不按 DP 数拆分。例如 40 请求、40 并发、2 DP，会先向 DP0 发 40 请求、并发 40，再向 DP1 发同样的 40 请求、并发 40。正式组仍使用 case 配置中的并发和请求数，默认走内部 LB。各 DP 的 HBM 需要容纳完整预埋集合，否则实际命中率可能低于目标值。Cache 的各 DP 预埋采用并行流程，Posix 将完整集合一次交给内部 LB 分发，详见下文。
 
+## HBM 裸推性能
+
+```bash
+python bench.py hbm-no-cache bench.json
+```
+
+每个 case 直接发送完整正式请求，使用配置中的输入长度、输出长度、并发和请求数，公共前缀长度为 0。整个流程只运行正式组，预埋、独立预热及 reset 均跳过，配置中的 `ucm_warmup.enabled=true` 也会在该模式下关闭。每个 case 默认使用独立随机 seed，支持固定 seed 和 `--dp-rank`。
+
+`hit_rate` 在该模式下可省略，使用已有配置时按 0 处理，汇总中的目标命中率和预埋长度均为 0。正式轮次的实际命中率、TTFT、TPOT、输出吞吐和总吞吐按原有方式采集，汇总 Mode 为 `hbm-no-cache`，支持 `--collect-metrics`。
+
+裸推基线应使用关闭 prefix caching、停用 UCM 的服务配置。此模式发送完整正式请求，服务端已有的缓存配置仍然生效，实际命中情况由指标给出。
+
 ## DeepSeek V4 MTP HBM 命中
 
 使用同一份 `bench.json` 执行全部 case。

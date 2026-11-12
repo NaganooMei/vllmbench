@@ -32,7 +32,7 @@ V4_HBM_TAIL_TOKENS = 32
 V4_HBM_MODES = ("v4hbm", "hbm-shared-v4")
 SHARED_HBM_MODES = ("hbm-shared", "hbm-shared-v4")
 PARALLEL_SEED_MODES = ("hbm-shared", "cache")
-HBM_MODES = ("hbm", "hbm-shared", *V4_HBM_MODES)
+HBM_MODES = ("hbm", "hbm-no-cache", "hbm-shared", *V4_HBM_MODES)
 
 
 def save_json(path: Path, value) -> None:
@@ -55,7 +55,9 @@ def normalize_case(case: dict, label: str, block: int, mode: str = "") -> None:
     for field in ("input_len", "output_len", "concurrency", "num_requests"):
         positive_integer(case.get(field), f"{label} {field}")
     try:
-        hit_rate = Decimal(str(case["hit_rate"]))
+        hit_rate = (
+            Decimal(0) if mode == "hbm-no-cache" else Decimal(str(case["hit_rate"]))
+        )
     except (KeyError, InvalidOperation) as error:
         raise ValueError(f"{label} requires a hit_rate between 0 and 1") from error
     if not hit_rate.is_finite() or not 0 <= hit_rate <= 1:
@@ -132,6 +134,8 @@ def load_config(path: Path, args) -> dict:
     warmup.setdefault("enabled", True)
     if not isinstance(warmup["enabled"], bool):
         raise ValueError("ucm_warmup.enabled must be true or false")
+    if args.mode == "hbm-no-cache":
+        warmup["enabled"] = False
     defaults = {
         "rounds": 1,
         "input_len": 8192,
@@ -809,7 +813,7 @@ class Experiment:
                         f"({case['expected_hbm_tokens'] / case['input_len']:.2%})",
                         flush=True,
                     )
-                if self.mode != "posix-run":
+                if self.mode not in ("posix-run", "hbm-no-cache"):
                     self.seed_case(case, directory)
                 if self.mode != "posix-seed":
                     if self.mode in ("cache", "posix-reset"):
@@ -846,6 +850,7 @@ def parse_args(argv=None):
         "mode",
         choices=(
             "hbm",
+            "hbm-no-cache",
             "hbm-shared",
             "hbm-shared-v4",
             "v4hbm",

@@ -264,6 +264,69 @@ class WorkflowTest(unittest.TestCase):
         self.assertFalse(any(kind == "reset" for kind, _ in self.events))
         self.assertFalse(any((self.root / "results").rglob("before.prom")))
 
+    def test_hbm_no_cache_only_measures_full_cases_with_auto_or_fixed_routing(self):
+        self.config["ucm_warmup"] = {"enabled": True}
+        self.config["seed"] = 2**32 - 2
+        self.config["cases"] = [
+            dict(
+                input_len=32768,
+                output_len=512,
+                hit_rate=0.9,
+                concurrency=40,
+                num_requests=40,
+            ),
+            dict(input_len=131072, output_len=512, concurrency=10, num_requests=10),
+        ]
+        self.save_config()
+        for rank in (None, 2):
+            with self.subTest(rank=rank):
+                self.events.clear()
+                options = ("--dp-rank", str(rank)) if rank is not None else ()
+                self.run_mode("hbm-no-cache", *options)
+                self.assertEqual(
+                    [kind for kind, _ in self.events],
+                    ["snapshot", "measure", "snapshot"] * 2,
+                )
+                commands = [
+                    command for kind, command in self.events if kind == "measure"
+                ]
+                for index, command in enumerate(commands):
+                    case = self.config["cases"][index]
+                    for flag, value in (
+                        ("--random-input-len", case["input_len"]),
+                        ("--random-output-len", case["output_len"]),
+                        ("--num-prompts", case["num_requests"]),
+                        ("--max-concurrency", case["concurrency"]),
+                        ("--random-prefix-len", 0),
+                        ("--random-range-ratio", 0),
+                        ("--seed", self.config["seed"] + index),
+                    ):
+                        self.assertEqual(command[command.index(flag) + 1], str(value))
+                    if rank is None:
+                        self.assertNotIn("--header", command)
+                    else:
+                        self.assertEqual(
+                            command[command.index("--header") + 1],
+                            f"X-data-parallel-rank={rank}",
+                        )
+        for manifest in self.manifests("hbm-no-cache"):
+            self.assertEqual(manifest["status"], "complete")
+            self.assertFalse(manifest["config"]["ucm_warmup"]["enabled"])
+            self.assertEqual(manifest["warmups"], [])
+            for case in manifest["cases"]:
+                self.assertEqual(case["hit_rate"], 0)
+                self.assertEqual(case["seed_tokens"], 0)
+        rows = list((self.root / "results").rglob("case_result.json"))
+        self.assertEqual(len(rows), 4)
+        for path in rows:
+            row = json.loads(path.read_text())
+            self.assertEqual(row["mode"], "hbm-no-cache")
+            self.assertEqual(row["target_hit_rate"], 0)
+            self.assertEqual(row["seed_tokens"], 0)
+            self.assertEqual(row["status"], "complete")
+            self.assertIn("tpot_mean_ms", row)
+            self.assertIn("total_tokens_per_s", row)
+
     def test_hbm_shared_seeds_one_per_dp_and_preserves_full_measurement(self):
         self.config["ucm_warmup"] = {"enabled": True}
         self.save_config()
