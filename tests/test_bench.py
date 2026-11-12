@@ -320,14 +320,72 @@ class WorkflowTest(unittest.TestCase):
         )
 
     def test_shared_seeds_overlap_on_distinct_dp_and_join_before_loading(self):
-        for mode in bench.SHARED_HBM_MODES:
-            with self.subTest(mode=mode):
-                self.assert_parallel_seeding(mode)
+        self.assert_parallel_seeding("hbm-shared")
 
     def test_shared_seed_failure_joins_all_dp_and_stops_measurement(self):
-        for mode in bench.SHARED_HBM_MODES:
-            with self.subTest(mode=mode):
-                self.assert_parallel_seeding(mode, failed_rank=1)
+        self.assert_parallel_seeding("hbm-shared", failed_rank=1)
+
+    def test_shared_v4_waits_for_each_rank_before_starting_next_seed(self):
+        original_process = self.fake_process
+        active = {}
+        finished = {}
+
+        def serial_process(command, **kwargs):
+            seed = command[command.index("--seed") + 1]
+            label = command[command.index("--result-filename") + 1]
+            self.assertFalse(active)
+            process = original_process(command, **kwargs)
+            if not label.startswith("seed_dp"):
+                self.assertEqual(finished[seed], [0, 1, 2])
+                return process
+            rank = int(command[command.index("--header") + 1].split("=")[1])
+            self.assertEqual(rank, len(finished.setdefault(seed, [])))
+            active[seed] = rank
+
+            def finish(*args, **kwargs):
+                self.assertEqual(active.pop(seed), rank)
+                finished[seed].append(rank)
+                return 0
+
+            process.wait.side_effect = finish
+            return process
+
+        with mock.patch.object(self, "fake_process", side_effect=serial_process):
+            self.assert_v4_hbm_workflow("hbm-shared-v4")
+        self.assertEqual(len(finished), 3)  # Two cases and one warmup.
+        self.assertFalse(active)
+
+    def test_shared_v4_seed_failure_stops_before_next_rank_and_measurement(self):
+        self.config["cases"] = [
+            dict(
+                input_len=32768,
+                output_len=1,
+                hit_rate=0.9,
+                concurrency=4,
+                num_requests=4,
+            )
+        ]
+        self.save_config()
+        original_process = self.fake_process
+
+        def failed_seed(command, **kwargs):
+            process = original_process(command, **kwargs)
+            label = command[command.index("--result-filename") + 1]
+            if label == "seed_dp1.json":
+                path = Path(command[command.index("--result-dir") + 1]) / label
+                result = json.loads(path.read_text(encoding="utf-8"))
+                result["failed"] = 1
+                path.write_text(json.dumps(result), encoding="utf-8")
+            return process
+
+        with mock.patch.object(self, "fake_process", side_effect=failed_seed):
+            self.run_mode("hbm-shared-v4", expected=1)
+        self.assertEqual([kind for kind, _ in self.events], ["seed", "seed"])
+        self.assertEqual(
+            [command[command.index("--header") + 1] for _, command in self.events],
+            ["X-data-parallel-rank=0", "X-data-parallel-rank=1"],
+        )
+        self.assertEqual(self.manifests("hbm-shared-v4")[0]["status"], "failed")
 
     def test_cache_and_posix_seed_full_sets_concurrently_on_distinct_dp(self):
         for mode in ("cache", "posix-seed", "posix-reset"):

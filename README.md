@@ -92,7 +92,7 @@ python bench.py hbm-shared-v4 bench.json
 
 结合公共前缀和 `v4hbm` 的 4096 向下取整再加 32 规则。每个 case 的所有请求共享 `seed_tokens` 长度的前缀，每个目标 DP 只预埋 1 条、并发 1、输出 1 token，全程不调用 reset。预埋和正式组使用相同 seed，并按正式请求数生成样本后只发送第一条预埋请求，以保持公共前缀一致。
 
-各 DP 并行预埋、rank header 路由、全部完成后等待及失败处理均与 `hbm-shared` 相同，也适用于预热组。
+各 DP 按 rank 顺序逐个预埋：DP0 成功完成后才发送 DP1，依此类推；每条请求仍携带对应的 rank header。全部成功后等待稳定时间，再进入下一阶段；任一 DP 失败即停止，不再向后续 DP 预埋，也不执行正式测试。正式 case 和预热组的预埋均采用此流程。`--dp-rank` 仍只覆盖指定 DP。
 
 例如正式输入 32768、目标 90%，预期 HBM token 为 28672，公共前缀和预埋总输入均为 28704。预埋使用 `--random-prefix-len 28704 --random-input-len 0`；正式组使用 `--random-prefix-len 28704 --random-input-len 4064`，保留配置中的请求数、并发及输出长度。vLLM 的 random 数据集支持非空公共前缀加零长度独立部分。正式请求默认走内部 LB，也支持 `--dp-rank`。
 

@@ -31,7 +31,7 @@ V4_HBM_ALIGNMENT = 4096
 V4_HBM_TAIL_TOKENS = 32
 V4_HBM_MODES = ("v4hbm", "hbm-shared-v4")
 SHARED_HBM_MODES = ("hbm-shared", "hbm-shared-v4")
-PARALLEL_SEED_MODES = (*SHARED_HBM_MODES, "cache", "posix-seed", "posix-reset")
+PARALLEL_SEED_MODES = ("hbm-shared", "cache", "posix-seed", "posix-reset")
 HBM_MODES = ("hbm", "hbm-shared", *V4_HBM_MODES)
 
 
