@@ -218,6 +218,8 @@ HBM 和 external 命中率来自 vLLM token 计数，按汇总后的分子与分
 
 终端和 CSV、Excel 汇总同时记录 TTFT、TPOT（均值，单位 ms）、输出吞吐量 `Output tok/s` 和总 token 吞吐量 `Total tok/s`。总吞吐量使用 vLLM 的 `total_token_throughput`，即成功请求的输入加输出 token 数除以正式 bench 时长，输入包含命中的缓存 token；输出吞吐量单独展示。上述性能指标无需开启 `--collect-metrics`。
 
+同时输出输入吞吐 `Input tok/s` 和估算 Prefill 吞吐 `Prefill est tok/s`，单位均为 token/s。输入吞吐按总吞吐减输出吞吐计算。Prefill 估算值按成功请求的输入 token 总数除以成功请求的 TTFT 总和计算，TTFT 使用秒；也等于成功请求的平均输入长度除以平均 TTFT。它包含命中缓存的输入 token，以及 TTFT 中的排队和加载耗时，属于按请求聚合的估算口径。CSV/Excel 字段分别为 `input_tokens_per_s` 和 `prefill_tokens_per_s_estimated`。缺少所需数据或 TTFT 总和为 0 时估算值留空，终端显示 `n/a`。`report` 可从历史结果的原始 bench JSON 补算新列。
+
 终端还显示 Target hit、HBM hit、External hit、Host Ready 和 Posix bytes。实际 0 命中显示 `0.0%`。缺少数据的列显示 `n/a`，Metrics 列标明计数读取或详细采集状态。
 
 可以重新汇总已有结果。旧版未写入汇总的 TPOT 或吞吐量会从仍然存在的原始 bench JSON 中补齐，无需重新压测。

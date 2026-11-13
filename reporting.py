@@ -39,6 +39,8 @@ FIELDS = (
     "ttft_p99_ms",
     "tpot_mean_ms",
     "duration_s",
+    "prefill_tokens_per_s_estimated",
+    "input_tokens_per_s",
     "output_tokens_per_s",
     "total_tokens_per_s",
     "hbm_hit_rate",
@@ -59,6 +61,14 @@ DEFINITIONS = (
     (
         "TPOT mean ms",
         "Mean per-request time per output token after the first token, in milliseconds.",
+    ),
+    (
+        "Prefill tokens/s (estimated)",
+        "Successful input tokens / sum of successful request TTFTs in seconds. Includes cached input tokens and TTFT queue/load time. This is a per-request aggregate estimate, not concurrent Prefill wall-clock throughput.",
+    ),
+    (
+        "Input tokens/s",
+        "Total tokens/s minus output tokens/s. Includes cached input tokens.",
     ),
     (
         "Output tokens/s",
@@ -117,6 +127,32 @@ def performance(result: dict) -> dict:
         if length > 1
     ]
     inputs = result.get("input_lens", [])
+    successful_ttfts = ttfts
+    if len(lengths) == len(ttfts):
+        successful_ttfts = [ttft for ttft, length in zip(ttfts, lengths) if length > 0]
+    elif result.get("failed", 0):
+        successful_ttfts = []
+    total_input = result.get("total_input_tokens")
+    if total_input is None and inputs:
+        if len(inputs) == len(lengths):
+            total_input = sum(
+                tokens for tokens, length in zip(inputs, lengths) if length > 0
+            )
+        elif not result.get("failed", 0):
+            total_input = sum(inputs)
+    ttft_seconds = sum(successful_ttfts)
+    if not ttfts and result.get("mean_ttft_ms") is not None:
+        ttft_seconds = result["mean_ttft_ms"] * result.get("completed", 0) / 1000
+    prefill_estimate = None
+    if total_input is not None and ttft_seconds > 0 and math.isfinite(ttft_seconds):
+        prefill_estimate = total_input / ttft_seconds
+    output_throughput = result.get("output_throughput")
+    total_throughput = result.get("total_token_throughput")
+    input_throughput = (
+        total_throughput - output_throughput
+        if total_throughput is not None and output_throughput is not None
+        else None
+    )
     return {
         "completed": result.get("completed"),
         "failed": result.get("failed", 0),
@@ -135,8 +171,10 @@ def performance(result: dict) -> dict:
             statistics.mean(tpots) * 1000 if tpots else result.get("mean_tpot_ms")
         ),
         "duration_s": result.get("duration"),
-        "output_tokens_per_s": result.get("output_throughput"),
-        "total_tokens_per_s": result.get("total_token_throughput"),
+        "prefill_tokens_per_s_estimated": prefill_estimate,
+        "input_tokens_per_s": input_throughput,
+        "output_tokens_per_s": output_throughput,
+        "total_tokens_per_s": total_throughput,
     }
 
 
@@ -296,11 +334,17 @@ def write_summary(directory: Path) -> list[dict]:
                 saved = json.loads(manifest.read_text(encoding="utf-8"))
                 result["served_model"] = saved.get("config", {}).get("served_model")
         results.append(result)
-    # Older case summaries omitted total throughput; recover it from bench JSON.
+    # Recover newly added metrics for older runs from their original bench JSON.
     for result in results:
         missing = [
             field
-            for field in ("tpot_mean_ms", "output_tokens_per_s", "total_tokens_per_s")
+            for field in (
+                "tpot_mean_ms",
+                "prefill_tokens_per_s_estimated",
+                "input_tokens_per_s",
+                "output_tokens_per_s",
+                "total_tokens_per_s",
+            )
             if result.get(field) is None
         ]
         source = result.get("bench_result_path")
@@ -310,6 +354,11 @@ def write_summary(directory: Path) -> list[dict]:
             )
             for field in missing:
                 result[field] = recovered.get(field)
+        if result.get("input_tokens_per_s") is None:
+            total = result.get("total_tokens_per_s")
+            output = result.get("output_tokens_per_s")
+            if total is not None and output is not None:
+                result["input_tokens_per_s"] = total - output
     rows = [[result.get(field) for field in FIELDS] for result in results]
     with (directory / "summary.csv").open(
         "w", encoding="utf-8-sig", newline=""
@@ -330,6 +379,8 @@ def write_summary(directory: Path) -> list[dict]:
         "Posix bytes",
         "TTFT ms",
         "TPOT ms",
+        "Prefill est tok/s",
+        "Input tok/s",
         "Output tok/s",
         "Total tok/s",
         "Status",
@@ -339,6 +390,8 @@ def write_summary(directory: Path) -> list[dict]:
     for result in results:
         ttft = result.get("ttft_mean_ms")
         tpot = result.get("tpot_mean_ms")
+        prefill_throughput = result.get("prefill_tokens_per_s_estimated")
+        input_throughput = result.get("input_tokens_per_s")
         output_throughput = result.get("output_tokens_per_s")
         total_throughput = result.get("total_tokens_per_s")
         values = [
@@ -362,6 +415,12 @@ def write_summary(directory: Path) -> list[dict]:
                 f"{posix_bytes:,.0f}" if posix_bytes is not None else "n/a",
                 f"{ttft:.2f}" if ttft is not None else "n/a",
                 f"{tpot:.2f}" if tpot is not None else "n/a",
+                (
+                    f"{prefill_throughput:.2f}"
+                    if prefill_throughput is not None
+                    else "n/a"
+                ),
+                f"{input_throughput:.2f}" if input_throughput is not None else "n/a",
                 f"{output_throughput:.2f}" if output_throughput is not None else "n/a",
                 f"{total_throughput:.2f}" if total_throughput is not None else "n/a",
                 result["status"],

@@ -1273,8 +1273,9 @@ class MetricsTest(unittest.TestCase):
 
         result = performance(
             {
-                "ttfts": [0.1, 0.1],
-                "latencies": [0.6, 0.7],
+                "ttfts": [0.1, 0.2],
+                "latencies": [0.6, 0.8],
+                "input_lens": [80, 120],
                 "output_lens": [6, 4],
                 "duration": 2,
                 "output_throughput": 5,
@@ -1284,6 +1285,29 @@ class MetricsTest(unittest.TestCase):
         self.assertAlmostEqual(result["tpot_mean_ms"], 150)
         self.assertEqual(result["output_tokens_per_s"], 5)
         self.assertEqual(result["total_tokens_per_s"], 105)
+        self.assertEqual(result["input_tokens_per_s"], 100)
+        self.assertAlmostEqual(result["prefill_tokens_per_s_estimated"], 200 / 0.3)
+
+    def test_prefill_estimate_excludes_failures_and_handles_missing_or_zero_ttft(self):
+        from reporting import performance
+
+        result = performance(
+            {
+                "total_input_tokens": 100,
+                "input_lens": [100, 900],
+                "output_lens": [1, 0],
+                "ttfts": [0.1, 1.0],
+                "failed": 1,
+            }
+        )
+        self.assertAlmostEqual(result["prefill_tokens_per_s_estimated"], 1000)
+        self.assertIsNone(result["input_tokens_per_s"])
+        for source in ({}, {"total_input_tokens": 100, "ttfts": [0]}):
+            self.assertIsNone(performance(source)["prefill_tokens_per_s_estimated"])
+        result = performance(
+            {"total_input_tokens": 200, "completed": 2, "mean_ttft_ms": 100}
+        )
+        self.assertAlmostEqual(result["prefill_tokens_per_s_estimated"], 1000)
 
     def test_console_summary_prints_real_zero_hits_and_missing_values(self):
         from reporting import write_summary
@@ -1297,6 +1321,8 @@ class MetricsTest(unittest.TestCase):
                         "mean_tpot_ms": 5,
                         "output_throughput": 6000,
                         "total_token_throughput": 7000,
+                        "total_input_tokens": 1000,
+                        "ttfts": [0.2, 0.3],
                     }
                 )
             )
@@ -1323,10 +1349,15 @@ class MetricsTest(unittest.TestCase):
             self.assertIn("TPOT ms", text)
             self.assertIn("Output tok/s", text)
             self.assertIn("Total tok/s", text)
+            self.assertIn("Input tok/s", text)
+            self.assertIn("Prefill est tok/s", text)
+            self.assertIn("2000.00", text)
             self.assertIn("5.00", text)
             self.assertIn("6000.00", text)
             self.assertIn("7000.00", text)
             self.assertEqual(rows[0]["total_tokens_per_s"], 7000)
+            self.assertEqual(rows[0]["input_tokens_per_s"], 1000)
+            self.assertEqual(rows[0]["prefill_tokens_per_s_estimated"], 2000)
             self.assertEqual(rows[0]["ttft_mean_ms"], 125)
             self.assertIn(
                 "total_tokens_per_s",
@@ -1337,6 +1368,10 @@ class MetricsTest(unittest.TestCase):
                     "total_tokens_per_s",
                     workbook.read("xl/worksheets/sheet1.xml").decode(),
                 )
+                for field in ("input_tokens_per_s", "prefill_tokens_per_s_estimated"):
+                    self.assertIn(
+                        field, workbook.read("xl/worksheets/sheet1.xml").decode()
+                    )
             self.assertIn("90.0%", text)
             self.assertEqual(
                 [cell.strip() for cell in text.split("|")].count("0.0%"), 2
