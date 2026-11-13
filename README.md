@@ -2,13 +2,46 @@
 
 通过 `vllm bench serve` 对比 HBM prefix cache、UCM Host Cache 和 UCM Posix 命中性能。Python 主程序及表格导出使用标准库，运行环境需要已有的 vLLM CLI，Python 版本要求 3.10 或更新。
 
+## 快速使用
+
+先修改 [bench.json](bench.json) 中的 `base_url`、`model`、`served_model`、`dp` 和 `cases`，在已安装 vLLM 的 Python 环境运行。
+
+```bash
+# 预览将要执行的命令
+python bench.py cache bench.json --dry-run
+# 正式运行并输出汇总表
+python bench.py cache bench.json
+# V4 公共前缀 HBM 测试
+python bench.py hbm-shared-v4 bench.json
+# 完整输入的裸推基线
+python bench.py hbm-no-cache bench.json
+```
+
+一次命令执行配置中的全部 case，生成一个 run 目录。每个正式 case 在汇总表占一行，预埋和预热各自保存日志。
+
+## 模式总览
+
+| 模式 | 预埋范围与顺序 | 预埋请求数和并发 | 正式前的处理 |
+| --- | --- | --- | --- |
+| `hbm` | 每个 DP，逐 DP 执行 | 每个 DP 使用 case 完整请求数和并发 | 保留 HBM |
+| `v4hbm` | 每个 DP，逐 DP 执行，使用 V4 长度规则 | 每个 DP 使用 case 完整请求数和并发 | 保留 HBM |
+| `hbm-shared` | 每个 DP，并行启动 | 每个 DP 1 条、并发 1，所有请求共用前缀 | 保留 HBM |
+| `hbm-shared-v4` | 每个 DP，逐 DP 执行，使用 V4 长度规则 | 每个 DP 1 条、并发 1，所有请求共用前缀 | 保留 HBM |
+| `hbm-no-cache` | 直接发送正式组 | case 完整请求数和并发 | 直接测量 |
+| `cache` | 每个 DP，并行启动 | 每个 DP 使用 case 完整请求数和并发 | `reset_external=false`，清 HBM |
+| `posix-seed` | 完整集合只发送一次，内部 LB 分配 | case 完整请求数和并发 | 保存预埋记录，供重启后使用 |
+| `posix-run` | 从预埋记录读取 seed | 正式组使用 case 请求数和并发 | 重启后先执行加载预热 |
+| `posix-reset` | 完整集合只发送一次，内部 LB 分配 | case 完整请求数和并发 | `reset_external=true`，清 HBM 和 UCM Cache |
+
+例如 DP4、40 请求、40 并发，`cache` 会同时向四个 DP 各发一组 40 条预埋请求；`posix-seed` 和 `posix-reset` 总共只预埋 40 条。正式组总共使用配置的 40 请求、40 并发。定向预埋通过 `X-data-parallel-rank` 指定 DP，`--dp-rank` 可将流程固定到一个 DP。
+
 ## 配置
 
 修改仓库中的 `bench.json`，填写服务地址、模型、DP 数以及全部 case。每个 case 提供 `input_len`、`output_len`、`hit_rate`、`concurrency`、`num_requests`，长度单位均为 token，命中率范围为 0～1。`concurrency` 和 `num_requests` 均按整个客户端测量批次计算。
 
 示例模型路径默认为 `/models/xxx`，运行时替换为实际模型目录。
 
-每轮自动生成随机 seed，每个 case 使用独立 seed。预埋和测量使用相同 seed 和请求数，随机长度波动固定为 0。可在配置中设置整数 `seed` 复现指定实验，默认采用随机生成。
+每次执行默认生成随机 seed，每个 case 和预热组各用独立 seed。同一组预埋与正式测量复用 seed，随机长度波动固定为 0。普通模式两阶段使用相同请求数，公共前缀模式按正式组的请求数生成样本后取第一条预埋，保持公共前缀一致。配置中的整数 `seed` 可用于复现实验，默认也可显式写为 `"random"`。
 
 UCM 预埋直接把 `--random-input-len` 设为目标命中长度，正式测量设为完整输入长度，两阶段均使用 `--dataset-name random --random-prefix-len 0`。例如 32K、90% 的预埋长度是 29491，正式长度是 32768。
 
@@ -17,7 +50,7 @@ UCM 预埋直接把 `--random-input-len` 设为目标命中长度，正式测量
 ```json
 {
   "routing": {"mode": "auto"},
-  "block_tokens": 1152,
+  "block_tokens": 1,
   "results_dir": "results",
   "seed_settle_seconds": 1,
   "reset_timeout_seconds": 60,
@@ -30,7 +63,7 @@ UCM 预埋直接把 `--random-input-len` 设为目标命中长度，正式测量
 }
 ```
 
-`block_tokens` 应填写服务的实际 LCM 缓存 block 长度。默认值为 1，服务最终按自己的缓存粒度决定命中长度。目标前缀按 block 向下取整。100% 目标会给最终 token 重算预留空间，实际比例以指标为准。模型的最大上下文需要容纳输入加输出。
+`block_tokens` 是可选的预埋长度对齐参数，默认值为 1。普通命中模式按它向下取整，服务端继续使用实际 KV block 粒度。`v4hbm` 和 `hbm-shared-v4` 固定使用 4096 对齐加 32 的规则。100% 目标会为尾部重算预留空间，实际比例由正式轮次指标给出。模型的最大上下文需要容纳输入加输出。
 
 ## HBM 命中
 
@@ -175,18 +208,20 @@ python bench.py cache bench.json --dp-rank 0
 HBM、Cache 和 Posix 命中测试都在全部正式 case 之前增加独立预热。沿用配置字段 `ucm_warmup`，默认在每个目标 DP 上执行 1 组，只预埋该组预热数据；每组 8K 输入、4 请求、4 并发、约 90% 前缀命中、输出 1 token。预热数据使用独立 seed，日志和 bench JSON 放在该轮的 `warmup_001/` 等目录中，正式汇总及 metrics 采集窗口从后续正式 case 开始。
 
 ```json
-"ucm_warmup": {
-  "enabled": true,
-  "rounds": 1,
-  "input_len": 8192,
-  "output_len": 1,
-  "hit_rate": 0.9,
-  "concurrency": 4,
-  "num_requests": 4
+{
+  "ucm_warmup": {
+    "enabled": true,
+    "rounds": 1,
+    "input_len": 8192,
+    "output_len": 1,
+    "hit_rate": 0.9,
+    "concurrency": 4,
+    "num_requests": 4
+  }
 }
 ```
 
-HBM 模式先向每个目标 DP 预埋预热组全部请求的独立前缀，再发送全长的预热组请求命中 HBM，不调用 reset。Cache 模式先预埋预热前缀、reset HBM，再向每个 DP 发送预热加载请求。Posix 的 `posix-seed` 同时预埋预热数据并保存其参数与 seed，重启后的 `posix-run` 先从 Posix 加载这些独立前缀，然后直接进入正式测试。每组预热使用不同 seed。自动 LB 模式覆盖所有 DP，固定 DP 模式覆盖指定 DP，预热组命中阶段每次 bench 的并发为配置中的 `concurrency`。
+普通 HBM 模式先向每个目标 DP 预埋预热组全部独立前缀。公共前缀 HBM 模式每个 DP 预埋一条，顺序或并发方式见模式总览。随后各目标 DP 依次执行完整预热请求组。Cache 模式先并行完成各 DP 的预埋、reset HBM，再向每个 DP 发送预热加载请求。Posix 的 `posix-seed` 同时预埋预热数据并保存其参数与 seed，重启后的 `posix-run` 先从 Posix 加载这些独立前缀，然后直接进入正式测试。每组预热使用不同 seed。自动 LB 模式覆盖所有 DP，固定 DP 模式覆盖指定 DP，预热组命中阶段每次 bench 的并发为配置中的 `concurrency`。
 
 `enabled` 设为 `false` 可关闭所有模式的独立预热组，正式 case 的前缀预埋仍会执行。Posix 重启后的预热参数和 seed 采用预埋记录中的值。历史预埋记录仍可继续测量，缺少预热数据时会提示本轮跳过加载预热，重新执行 `posix-seed` 可生成预热数据。
 
@@ -231,6 +266,35 @@ python bench.py report results/
 原来的 Bash 入口也会调用通用工具，`ucm-seed` 和 `ucm-run` 分别映射到 `posix-seed`、`posix-run`。`BENCH_CONFIG` 可以指定配置文件，原有的 MODEL、SERVED_MODEL、HOST、PORT、SEED、BLOCK_TOKENS、RESULT_DIR 和 DRY_RUN 环境变量继续生效。
 
 无请求预览可使用 `--dry-run`。`posix-run` 预览读取已有预埋记录。默认用完整 CLI 帮助检测参数。缺少 `--ready-check-timeout-sec` 时，通过当前 Python 环境中的同一个 vLLM CLI 入口，仅替换可识别的 `wait_for_endpoint` 试跑 hook，避免首条测量请求提前热缓存。未识别的实现会在发请求前报错。
+
+## 指标口径与结果定位
+
+| 列 | 计算口径 |
+| --- | --- |
+| `Output tok/s` | 成功请求的输出 token 总数 ÷ 正式测试整组耗时 |
+| `Total tok/s` | 成功请求的输入加输出 token 总数 ÷ 正式测试整组耗时 |
+| `Input tok/s` | 总吞吐减输出吞吐 |
+| `Prefill est tok/s` | 成功请求的输入 token 总数 ÷ 成功请求的 TTFT 总和，TTFT 使用秒 |
+| `HBM hit` | 正式窗口的 HBM hit token 增量 ÷ HBM query token 增量 |
+| `External hit` | 正式窗口的 external hit token 增量 ÷ HBM query token 增量 |
+| `Host Ready` | 加载时已经 Ready 的 Host Cache shard 数 ÷ 成功加载 shard 数 |
+| `Posix bytes` | `ucm:posix_s2h_bytes_total` 在正式窗口内的增量，汇总各 worker，单位 bytes |
+
+吞吐的输入 token 包含缓存命中的部分。`Prefill est tok/s` 的分母累计每条请求的 TTFT，包含排队和 KV 加载耗时。AISBench 工具的 Prefill 指标请在其原生性能报告中查看，两套工具的汇总列说明见各自 README。
+
+`external_hit_rate_remaining` 另存在 CSV/Excel 中，分母为 external query token。`External hit` 包含 UCM Host Cache 和 Posix 的命中贡献，加载来源可结合 `Host Ready` 与 `Posix bytes` 判断。目标 90% 会受到预埋对齐、缓存驻留及实际请求复用影响，正式轮次输出实际命中率。
+
+默认轻量计数读取也会填充 `Posix bytes`，服务端提供该计数器时可直接查看。真实零读取显示 `0`，指标缺失显示 `n/a`。
+
+### 输出配置为 128，为什么有 1 token 的结果
+
+| 文件或阶段 | 输出长度 |
+| --- | --- |
+| `seed_dp*.json`、`seed_auto.json` | 固定 1 token |
+| `warmup_*/warmup_load_dp*.json` | 默认 1 token，使用预热配置 |
+| 正式 case 下的 `measure.json` | 使用该 case 的 `output_len` |
+
+正式请求包含 `--ignore-eos`，脚本逐条检查 `output_lens`。配置 128 而正式输出长度为 1 时，会记录 `unexpected output token counts` 并结束本轮。对应的 `measure.command.json` 和 `measure.log` 可用于核对正式命令与服务返回。
 
 ## 实验锁
 
